@@ -1,22 +1,23 @@
 # =============================================================================
-# MEDILOY PHASE TRANSFORMATION SIMULATOR
+# MEDILOY PHASE TRANSFORMATION SIMULATOR – PLOTLY VISUALIZATION VERSION
 # γ-FCC → ε-HCP Martensitic Transformation in Co-Cr-Mo Dental Alloys
 # Temperature: 950°C (1223.15 K) - Pseudo-binary Co-M_y model
 # =============================================================================
 # Author: Phase-Field Modeling Framework
-# License: MIT
-# Dependencies: numpy, numba, matplotlib, streamlit
-# Run with: streamlit run mediloy_phase_transformation.py
+# Dependencies: numpy, numba, plotly, streamlit
+# Run with: streamlit run mediloy_phase_transformation_plotly.py
 # =============================================================================
 
 import numpy as np
 from numba import njit, prange
-import matplotlib.pyplot as plt
 import streamlit as st
-from io import BytesIO
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 import time
 import sys
-from datetime import datetime
+from io import BytesIO
+import base64
 
 # =============================================================================
 # PHYSICAL SCALES FOR MEDILOY (Co-Cr-Mo-Si-W at 950°C)
@@ -748,6 +749,12 @@ class MediloyPhaseTransformation:
         interface_width_c = self.scales.phys_to_interface_width(self.kappa_c, self.W_phys)
         interface_width_eta = self.scales.phys_to_interface_width(self.kappa_eta, self.W_phys)
         
+        # Min/Max fields
+        c_min = float(np.min(self.c))
+        c_max = float(np.max(self.c))
+        eta_min = float(np.min(self.eta))
+        eta_max = float(np.max(self.eta))
+        
         return {
             # Time
             'time_phys': self.time_phys,
@@ -762,10 +769,12 @@ class MediloyPhaseTransformation:
             # Field statistics
             'eta_mean': float(np.mean(self.eta)),
             'eta_std': float(np.std(self.eta)),
-            'eta_min': float(np.min(self.eta)),
-            'eta_max': float(np.max(self.eta)),
+            'eta_min': eta_min,
+            'eta_max': eta_max,
             'c_mean': float(np.mean(self.c)),
             'c_std': float(np.std(self.c)),
+            'c_min': c_min,
+            'c_max': c_max,
             
             # Phase fractions
             'hcp_fraction': float(np.sum(self.eta > 0.5) / (self.nx * self.ny)),
@@ -786,7 +795,7 @@ class MediloyPhaseTransformation:
 
 
 # =============================================================================
-# STREAMLIT APPLICATION: Interactive Mediloy Simulator
+# STREAMLIT APPLICATION: Interactive Mediloy Simulator with Plotly Visuals
 # =============================================================================
 
 def main():
@@ -794,7 +803,7 @@ def main():
     
     # Page configuration
     st.set_page_config(
-        page_title="Mediloy γ→ε Phase Transformation",
+        page_title="Mediloy γ→ε Phase Transformation (Plotly)",
         page_icon="⚙️",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -1027,8 +1036,12 @@ def main():
             st.metric("max(c)", f"{stats.get('c_max', 1):.3f}")
     
     # =============================================================================
-    # MAIN CONTENT: Visualizations
+    # MAIN CONTENT: Plotly Visualizations
     # =============================================================================
+    
+    # Physical extent for axis labels (convert grid to μm)
+    extent_um_x = [0, sim.nx * sim.dx_phys * 1e6]
+    extent_um_y = [0, sim.ny * sim.dx_phys * 1e6]
     
     # Row 1: Structural order parameter + Concentration field
     col_viz1, col_viz2 = st.columns(2)
@@ -1037,132 +1050,107 @@ def main():
         st.subheader("ε-HCP Order Parameter η")
         st.caption(f"η = 0 (<span class='phase-fcc'>FCC</span>) → η = 1 (<span class='phase-hcp'>HCP</span>) | t = {stats['time_formatted']}")
         
-        fig_eta, ax_eta = plt.subplots(figsize=(7, 6.5), dpi=100)
-        
-        # Physical extent for axis labels (convert grid to μm)
-        extent_um = [
-            0, sim.nx * sim.dx_phys * 1e6,  # x: 0 to L_x in μm
-            0, sim.ny * sim.dx_phys * 1e6   # y: 0 to L_y in μm
-        ]
-        
-        im_eta = ax_eta.imshow(
-            sim.eta.T,  # Transpose for correct orientation
-            cmap='RdYlBu_r', 
-            origin='lower', 
-            vmin=0, vmax=1,
-            extent=extent_um,
-            interpolation='bilinear'
+        fig_eta = go.Figure(data=go.Heatmap(
+            z=sim.eta.T,
+            x=np.linspace(extent_um_x[0], extent_um_x[1], sim.nx),
+            y=np.linspace(extent_um_y[0], extent_um_y[1], sim.ny),
+            colorscale='RdYlBu_r',
+            zmin=0, zmax=1,
+            colorbar=dict(title="η", tickvals=[0, 0.5, 1], ticktext=['FCC', 'Interface', 'HCP']),
+            hovertemplate='x: %{x:.2f} μm<br>y: %{y:.2f} μm<br>η: %{z:.3f}<extra></extra>'
+        ))
+        fig_eta.update_layout(
+            title="Martensitic HCP Phase Distribution",
+            xaxis_title="x (μm)",
+            yaxis_title="y (μm)",
+            width=600, height=550,
+            margin=dict(l=40, r=40, t=60, b=40)
         )
-        ax_eta.set_xlabel("x (μm)")
-        ax_eta.set_ylabel("y (μm)")
-        ax_eta.set_title("Martensitic HCP Phase Distribution")
-        ax_eta.set_aspect('equal')
-        
-        cbar_eta = plt.colorbar(im_eta, ax=ax_eta, label="Order parameter η")
-        cbar_eta.ax.tick_params(labelsize=9)
-        cbar_eta.set_ticks([0, 0.5, 1.0])
-        cbar_eta.set_ticklabels(['FCC', 'Interface', 'HCP'])
-        
-        # Add interface width indicator
-        xi_um = stats['interface_width_eta_nm'] * 1e-3
-        if 0.001 <= xi_um <= 0.1:
-            ax_eta.text(0.02, 0.98, f"ξ ≈ {stats['interface_width_eta_nm']:.2f} nm", 
-                       transform=ax_eta.transAxes, fontsize=9,
-                       verticalalignment='top', 
-                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.6))
-        
-        st.pyplot(fig_eta, use_container_width=True)
-        plt.close(fig_eta)
+        st.plotly_chart(fig_eta, use_container_width=True)
     
     with col_viz2:
         st.subheader("Co Concentration c_Co")
         st.caption("Nominal composition: c₀ = 0.61 (61 at.% Co)")
         
-        fig_c, ax_c = plt.subplots(figsize=(7, 6.5), dpi=100)
-        
-        im_c = ax_c.imshow(
-            sim.c.T,
-            cmap='viridis',
-            origin='lower',
-            vmin=0.55, vmax=0.67,  # Focus on relevant composition range
-            extent=extent_um,
-            interpolation='bilinear'
+        fig_c = go.Figure(data=go.Heatmap(
+            z=sim.c.T,
+            x=np.linspace(extent_um_x[0], extent_um_x[1], sim.nx),
+            y=np.linspace(extent_um_y[0], extent_um_y[1], sim.ny),
+            colorscale='Viridis',
+            zmin=0.55, zmax=0.67,
+            colorbar=dict(title="c_Co"),
+            hovertemplate='x: %{x:.2f} μm<br>y: %{y:.2f} μm<br>c: %{z:.3f}<extra></extra>'
+        ))
+        fig_c.update_layout(
+            title="Cobalt Mole Fraction Distribution",
+            xaxis_title="x (μm)",
+            yaxis_title="y (μm)",
+            width=600, height=550,
+            margin=dict(l=40, r=40, t=60, b=40)
         )
-        ax_c.set_xlabel("x (μm)")
-        ax_c.set_ylabel("y (μm)")
-        ax_c.set_title("Cobalt Mole Fraction Distribution")
-        ax_c.set_aspect('equal')
-        
-        cbar_c = plt.colorbar(im_c, ax=ax_c, label="c_Co")
-        cbar_c.ax.tick_params(labelsize=9)
-        
-        # Mark nominal composition
-        ax_c.axhline(y=0, color='white', linestyle=':', linewidth=0.5, alpha=0.3)
-        
-        st.pyplot(fig_c, use_container_width=True)
-        plt.close(fig_c)
+        st.plotly_chart(fig_c, use_container_width=True)
     
-    # Row 2: Overlay visualization + Histogram
+    # Row 2: Overlay visualization (concentration + η contours)
     col_overlay, col_hist = st.columns([2, 1])
     
     with col_overlay:
         st.subheader("Phase + Composition Overlay")
         st.caption("HCP regions (red) with Co depletion (blue) at interfaces")
         
-        fig_overlay, ax_overlay = plt.subplots(figsize=(7, 6.5), dpi=100)
-        
-        # Base: concentration field
-        im_base = ax_overlay.imshow(sim.c.T, cmap='viridis', origin='lower',
-                                   vmin=0.55, vmax=0.67, extent=extent_um,
-                                   interpolation='bilinear', alpha=0.7)
-        
-        # Overlay: HCP phase boundaries (contours)
-        contour_levels = [0.3, 0.5, 0.7]
-        cs = ax_overlay.contour(sim.eta.T, levels=contour_levels, 
-                               colors='red', linewidths=1.5,
-                               extent=extent_um, origin='lower')
-        ax_overlay.clabel(cs, inline=True, fontsize=8, fmt='η=%.1f')
-        
-        ax_overlay.set_xlabel("x (μm)")
-        ax_overlay.set_ylabel("y (μm)")
-        ax_overlay.set_title("HCP Phase Boundaries on Co Concentration")
-        ax_overlay.set_aspect('equal')
-        
-        st.pyplot(fig_overlay, use_container_width=True)
-        plt.close(fig_overlay)
+        fig_overlay = go.Figure()
+        # Base: concentration heatmap
+        fig_overlay.add_trace(go.Heatmap(
+            z=sim.c.T,
+            x=np.linspace(extent_um_x[0], extent_um_x[1], sim.nx),
+            y=np.linspace(extent_um_y[0], extent_um_y[1], sim.ny),
+            colorscale='Viridis',
+            zmin=0.55, zmax=0.67,
+            opacity=0.7,
+            colorbar=dict(title="c_Co", x=1.02),
+            showscale=True
+        ))
+        # Contours of η
+        levels = [0.3, 0.5, 0.7]
+        for level in levels:
+            fig_overlay.add_trace(go.Contour(
+                z=sim.eta.T,
+                x=np.linspace(extent_um_x[0], extent_um_x[1], sim.nx),
+                y=np.linspace(extent_um_y[0], extent_um_y[1], sim.ny),
+                contours=dict(start=level, end=level, size=0.1),
+                line=dict(color='red', width=1.5),
+                showscale=False,
+                hoverinfo='skip',
+                name=f'η = {level:.1f}'
+            ))
+        fig_overlay.update_layout(
+            title="HCP Phase Boundaries on Co Concentration",
+            xaxis_title="x (μm)",
+            yaxis_title="y (μm)",
+            width=700, height=550,
+            margin=dict(l=40, r=40, t=60, b=40)
+        )
+        st.plotly_chart(fig_overlay, use_container_width=True)
     
     with col_hist:
         st.subheader("Composition Distribution")
         
-        fig_hist, ax_hist = plt.subplots(figsize=(5, 4.5), dpi=100)
-        
-        # Histogram of Co concentration
-        counts, bins, _ = ax_hist.hist(
-            sim.c.flatten(), 
-            bins=40, 
-            range=[0.55, 0.67],
-            alpha=0.7, 
-            color='steelblue', 
-            edgecolor='black',
-            density=True
+        # Histogram using plotly express
+        hist_data = sim.c.flatten()
+        fig_hist = px.histogram(
+            hist_data, nbins=40, range_x=[0.55, 0.67],
+            labels={'value': 'Co mole fraction c_Co', 'count': 'Frequency'},
+            title="Co Concentration Distribution"
         )
-        
-        # Mark nominal composition and phase-related features
-        ax_hist.axvline(0.61, color='gray', linestyle='--', linewidth=2, 
-                       label='Nominal c₀ = 0.61')
-        ax_hist.axvline(stats['c_mean'], color='red', linestyle='-', 
-                       linewidth=2, label=f"⟨c⟩ = {stats['c_mean']:.3f}")
-        
-        ax_hist.set_xlim(0.55, 0.67)
-        ax_hist.set_xlabel("Co mole fraction c_Co")
-        ax_hist.set_ylabel("Probability density")
-        ax_hist.legend(fontsize=8)
-        ax_hist.grid(True, alpha=0.3, linestyle=':')
-        
-        st.pyplot(fig_hist, use_container_width=True)
-        plt.close(fig_hist)
+        # Add vertical lines
+        fig_hist.add_vline(x=0.61, line_dash="dash", line_color="gray", annotation_text="Nominal c₀=0.61")
+        fig_hist.add_vline(x=stats['c_mean'], line_dash="dash", line_color="red", annotation_text=f"⟨c⟩={stats['c_mean']:.3f}")
+        fig_hist.update_layout(
+            width=400, height=500,
+            margin=dict(l=40, r=20, t=60, b=40)
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
     
-    # Row 3: Kinetics plots
+    # Row 3: Kinetics plots (subplots)
     st.divider()
     st.subheader("📈 Transformation Kinetics")
     
@@ -1170,47 +1158,57 @@ def main():
         times_s = np.array(sim.history['time_phys'])
         times_min = times_s / 60  # Convert to minutes for metallurgical relevance
         
-        fig_kin, axes = plt.subplots(1, 3, figsize=(15, 4.5), dpi=100)
+        # Create subplots: 1 row, 3 columns
+        fig_kin = make_subplots(
+            rows=1, cols=3,
+            subplot_titles=("Martensitic Transformation Progress", 
+                            "Solute Redistribution",
+                            "Interface Evolution"),
+            shared_xaxes=True,
+            x_title="Time (minutes)"
+        )
         
-        # Plot 1: HCP fraction vs time
-        axes[0].plot(times_min, sim.history['eta_mean'], color='#e74c3c', 
-                    linestyle='-', linewidth=2.5, label='⟨η⟩ (HCP fraction)')
-        axes[0].axhline(0.5, color='gray', linestyle=':', linewidth=0.5, alpha=0.5)
-        axes[0].set_xlabel("Time (minutes)")
-        axes[0].set_ylabel("HCP volume fraction")
-        axes[0].set_title("Martensitic Transformation Progress")
-        axes[0].grid(True, alpha=0.3, linestyle=':')
-        axes[0].legend(fontsize=9)
-        axes[0].set_ylim(0, 1.05)
+        # Plot 1: HCP fraction (η_mean)
+        fig_kin.add_trace(
+            go.Scatter(x=times_min, y=sim.history['eta_mean'],
+                       mode='lines', name='⟨η⟩ (HCP fraction)',
+                       line=dict(color='#e74c3c', width=2.5)),
+            row=1, col=1
+        )
+        fig_kin.add_hline(y=0.5, line_dash="dash", line_color="gray", row=1, col=1)
+        fig_kin.update_yaxes(title_text="HCP volume fraction", row=1, col=1)
         
-        # Plot 2: Co concentration evolution
-        axes[1].plot(times_min, sim.history['c_mean'], color='#2ecc71', 
-                    linestyle='-', linewidth=2, label='⟨c_Co⟩')
-        axes[1].axhline(0.61, color='gray', linestyle=':', linewidth=0.5, alpha=0.5,
-                       label='Nominal c₀')
-        axes[1].plot(times_min, sim.history['c_std'], color='#f39c12', 
-                    linestyle='--', linewidth=1.5, label='σ(c_Co)')
-        axes[1].set_xlabel("Time (minutes)")
-        axes[1].set_ylabel("Co fraction / Std. dev.")
-        axes[1].set_title("Solute Redistribution")
-        axes[1].grid(True, alpha=0.3, linestyle=':')
-        axes[1].legend(fontsize=8)
+        # Plot 2: Co concentration mean and std
+        fig_kin.add_trace(
+            go.Scatter(x=times_min, y=sim.history['c_mean'],
+                       mode='lines', name='⟨c_Co⟩',
+                       line=dict(color='#2ecc71', width=2)),
+            row=1, col=2
+        )
+        fig_kin.add_trace(
+            go.Scatter(x=times_min, y=sim.history['c_std'],
+                       mode='lines', name='σ(c_Co)',
+                       line=dict(color='#f39c12', width=1.5, dash='dash')),
+            row=1, col=2
+        )
+        fig_kin.add_hline(y=0.61, line_dash="dash", line_color="gray", row=1, col=2)
+        fig_kin.update_yaxes(title_text="Co fraction / Std. dev.", row=1, col=2)
         
-        # Plot 3: Interface sharpness (order parameter std)
-        axes[2].plot(times_min, sim.history['eta_std'], color='#9b59b6', 
-                    linestyle='-', linewidth=2, label='σ(η)')
-        axes[2].set_xlabel("Time (minutes)")
-        axes[2].set_ylabel("Order parameter std. dev.")
-        axes[2].set_title("Interface Evolution")
-        axes[2].grid(True, alpha=0.3, linestyle=':')
-        axes[2].legend(fontsize=9)
-        axes[2].text(0.02, 0.98, 'Higher σ(η) = sharper interfaces', 
-                    transform=axes[2].transAxes, fontsize=8,
-                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lavender', alpha=0.5))
+        # Plot 3: Order parameter std (interface sharpness)
+        fig_kin.add_trace(
+            go.Scatter(x=times_min, y=sim.history['eta_std'],
+                       mode='lines', name='σ(η)',
+                       line=dict(color='#9b59b6', width=2)),
+            row=1, col=3
+        )
+        fig_kin.update_yaxes(title_text="Order parameter std. dev.", row=1, col=3)
         
-        plt.tight_layout()
-        st.pyplot(fig_kin, use_container_width=True)
-        plt.close(fig_kin)
+        fig_kin.update_layout(
+            height=450, width=1200,
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig_kin, use_container_width=True)
         
         # Optional: Free energy evolution
         with st.expander("🔋 Free Energy Evolution (click to expand)"):
@@ -1218,17 +1216,20 @@ def main():
             valid_times = [t for t, e in zip(times_min, sim.history['total_energy']) if not np.isnan(e)]
             
             if len(valid_energy) > 2:
-                fig_fe, ax_fe = plt.subplots(figsize=(6, 4), dpi=100)
-                ax_fe.plot(valid_times, valid_energy, color='#8e44ad', 
-                          linestyle='-', linewidth=2, marker='o', markersize=3)
-                ax_fe.set_xlabel("Time (minutes)")
-                ax_fe.set_ylabel("Total free energy (J)")
-                ax_fe.set_title("Free Energy Minimization")
-                ax_fe.grid(True, alpha=0.3, linestyle=':')
-                ax_fe.ticklabel_format(style='sci', axis='y', scilimits=(0,0))
-                plt.tight_layout()
-                st.pyplot(fig_fe, use_container_width=True)
-                plt.close(fig_fe)
+                fig_fe = go.Figure()
+                fig_fe.add_trace(go.Scatter(
+                    x=valid_times, y=valid_energy,
+                    mode='lines+markers', name='Total free energy',
+                    line=dict(color='#8e44ad', width=2),
+                    marker=dict(size=3)
+                ))
+                fig_fe.update_layout(
+                    title="Free Energy Minimization",
+                    xaxis_title="Time (minutes)",
+                    yaxis_title="Total free energy (J)",
+                    height=400
+                )
+                st.plotly_chart(fig_fe, use_container_width=True)
             else:
                 st.info("Run more steps to compute free energy evolution.")
     else:
@@ -1244,30 +1245,33 @@ def main():
     
     with col_exp1:
         if st.button("📸 Save Microstructure Snapshot", use_container_width=True):
-            fig, ax = plt.subplots(figsize=(10, 8), dpi=150)
-            im = ax.imshow(sim.eta.T, cmap='RdYlBu_r', origin='lower', vmin=0, vmax=1,
-                          extent=extent_um, interpolation='bilinear')
-            ax.set_xlabel("x (μm)")
-            ax.set_ylabel("y (μm)")
-            ax.set_title(f"Mediloy HCP Phase Distribution\n t = {stats['time_formatted']}")
-            ax.set_aspect('equal')
-            cbar = plt.colorbar(im, ax=ax, label="η: 0=FCC, 1=HCP")
-            cbar.set_ticks([0, 0.5, 1.0])
-            cbar.set_ticklabels(['FCC', 'Interface', 'HCP'])
-            
-            buf = BytesIO()
-            plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
-            plt.close(fig)
-            buf.seek(0)
-            
-            filename = f"Mediloy_HCP_t{sim.time_phys:.2e}s.png"
-            st.download_button(
-                label="⬇️ Download PNG",
-                data=buf.getvalue(),
-                file_name=filename,
-                mime="image/png",
-                use_container_width=True
+            # Create a plotly figure for the snapshot
+            fig_snap = go.Figure(data=go.Heatmap(
+                z=sim.eta.T,
+                x=np.linspace(extent_um_x[0], extent_um_x[1], sim.nx),
+                y=np.linspace(extent_um_y[0], extent_um_y[1], sim.ny),
+                colorscale='RdYlBu_r',
+                zmin=0, zmax=1,
+                colorbar=dict(title="η", tickvals=[0, 0.5, 1], ticktext=['FCC', 'Interface', 'HCP'])
+            ))
+            fig_snap.update_layout(
+                title=f"Mediloy HCP Phase Distribution<br>t = {stats['time_formatted']}",
+                xaxis_title="x (μm)",
+                yaxis_title="y (μm)",
+                width=800, height=700
             )
+            # Export as PNG (requires kaleido)
+            try:
+                img_bytes = fig_snap.to_image(format="png", width=800, height=700, scale=2)
+                st.download_button(
+                    label="⬇️ Download PNG",
+                    data=img_bytes,
+                    file_name=f"Mediloy_HCP_t{sim.time_phys:.2e}s.png",
+                    mime="image/png",
+                    use_container_width=True
+                )
+            except Exception as e:
+                st.error(f"Could not generate image. Ensure 'kaleido' is installed (`pip install kaleido`). Error: {e}")
     
     with col_exp2:
         if st.button("📊 Save Kinetics Data", use_container_width=True):
@@ -1450,7 +1454,7 @@ def main():
     st.caption(
         "Mediloy γ→ε Phase-Field Simulator | Hybrid Cahn-Hilliard + Allen-Cahn | "
         f"Physical Units: m, s, J/m³ | T = {sim.T_celsius}°C | "
-        f"Pseudo-binary Co-M<sub>y</sub> (c₀ = 0.61)"
+        f"Pseudo-binary Co-M<sub>y</sub> (c₀ = 0.61) | Visualized with Plotly"
     )
 
 
@@ -1460,7 +1464,7 @@ def main():
 
 if __name__ == "__main__":
     # Print startup info to console
-    print("⚙️ Starting Mediloy Phase Transformation Simulator...")
+    print("⚙️ Starting Mediloy Phase Transformation Simulator (Plotly version)...")
     print(f"   Python: {sys.version.split()[0]}")
     print(f"   NumPy: {np.__version__}")
     print(f"   Numba: JIT compilation enabled")
