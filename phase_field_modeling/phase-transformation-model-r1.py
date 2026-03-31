@@ -739,10 +739,13 @@ def main():
             help="Controls chemical driving force for phase separation"
         )
         
-        # Diffusion coefficient (log scale)
+        # Diffusion coefficient (log scale) - FIXED: All float types for consistency
         D_b_exp = st.slider(
-            "log₁₀(D_Cr) [m²/s]", 
-            -17, -13, -14.3, 0.1,
+            "log₁₀(D_Cr) [m²/s]",
+            -17.0,      # min_value as float (FIXED)
+            -13.0,      # max_value as float (FIXED)
+            -14.3,      # value as float
+            0.1,        # step as float
             help="Cr diffusion coefficient in Co matrix at 950°C"
         )
         D_b_val = 10**D_b_exp
