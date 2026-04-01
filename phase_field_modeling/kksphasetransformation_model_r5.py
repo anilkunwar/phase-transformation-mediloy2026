@@ -711,7 +711,7 @@ def main():
         
         elif init_type == "HCP seeds in FCC":
             num_seeds = st.slider("Number of HCP seeds", 1, 50, 12, 1)
-            seed_radius = st.slider("Seed radius (grid units)", 3, 15, 5, 1)
+            seed_radius = st.slider("Seed radius (grid units)", 3, 50, 5, 1)
             if st.button("🌱 Initialize with HCP Seeds", use_container_width=True):
                 sim.initialize_fcc_with_random_hcp_seeds(
                     num_seeds=num_seeds, radius_grid=seed_radius, seed=42
