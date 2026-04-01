@@ -13,6 +13,7 @@
 #   - Gradient energy ONLY on η (NO κ_c|∇c|² term) - interface regularized by η alone
 #   - All Numba functions use type inference (no explicit scalar signatures)
 #   - Improved initialization: 250 μm domain, 4 geometries, r_eq > 10ξ guarantee
+#   - FIXED: Adaptive parameter ranges to prevent StreamlitValueAboveMaxError
 # =============================================================================
 
 import numpy as np
@@ -905,24 +906,92 @@ def main():
         st.subheader("⚙️ Model Parameters (KKS)")
         st.caption("Physical parameters for phase transformation")
         
+        # FIXED: Calculate adaptive ranges based on current simulation state
+        # This prevents StreamlitValueAboveMaxError when kappa_eta exceeds hardcoded limits
         xi_eta_nm = sim.scales.phys_to_interface_width(sim.kappa_eta, sim.W_phys) * 1e9
+        
+        # Calculate safe adaptive ranges for kappa_eta based on current W_phys
+        # κ_η = ξ² × W, where ξ can range from 3×dx to 12×dx
+        dx_phys = sim.domain_size_um * 1e-6 / sim.nx  # ≈ 4.88e-7 m for 250μm/512
+        kappa_eta_min_safe = (3.0 * dx_phys)**2 * sim.W_phys * 0.1  # 10% below minimum
+        kappa_eta_max_safe = (15.0 * dx_phys)**2 * sim.W_phys * 10.0  # 10× above maximum for safety
+        
+        # Ensure we don't go below physical minimums
+        kappa_eta_min_safe = max(kappa_eta_min_safe, 1e-15)
+        kappa_eta_max_safe = min(kappa_eta_max_safe, 1e-3)  # Cap at reasonable maximum
         
         col_p1, col_p2 = st.columns(2)
         with col_p1:
-            W_phys = st.number_input("W (J/m³)", 1e4, 1e8, float(sim.W_phys), format="%.2e")
-            kappa_eta_phys = st.number_input("κ_η (J/m) [ONLY on η]", 1e-13, 1e-9, float(sim.kappa_eta), format="%.2e")
-            driving_force = st.number_input("ΔG (J/mol)", -2000, 2000, 400, 50)
+            W_phys = st.number_input(
+                "W (J/m³)", 
+                min_value=1e4, 
+                max_value=1e10, 
+                value=float(sim.W_phys), 
+                format="%.2e",
+                help="Double-well barrier height. Typical: 1e7-1e8 J/m³"
+            )
+            kappa_eta_phys = st.number_input(
+                "κ_η (J/m) [ONLY on η]", 
+                min_value=float(kappa_eta_min_safe), 
+                max_value=float(kappa_eta_max_safe), 
+                value=float(sim.kappa_eta), 
+                format="%.2e",
+                help=f"Gradient coefficient. Auto-range: {kappa_eta_min_safe:.2e} to {kappa_eta_max_safe:.2e} J/m"
+            )
+            driving_force = st.number_input(
+                "ΔG (J/mol)", 
+                min_value=-2000, 
+                max_value=2000, 
+                value=400, 
+                step=50,
+                help="Chemical driving force. Typical: 200-600 J/mol at 950°C"
+            )
         with col_p2:
-            L_eta_phys = st.number_input("L_η (m³/J·s)", 1e-15, 1e-5, float(sim.L_struct), format="%.2e")
-            dt_phys = st.number_input("Δt (s)", 1e-12, 1e-5, float(sim.dt_phys), format="%.2e")
-            c_epsilon_eq = st.number_input("c_ε^eq", 0.50, 0.61, float(sim.c_epsilon_eq), 0.005)
+            L_eta_phys = st.number_input(
+                "L_η (m³/J·s)", 
+                min_value=1e-15, 
+                max_value=1e-5, 
+                value=float(sim.L_struct), 
+                format="%.2e",
+                help="Allen-Cahn mobility. Typically 10-100× larger than M"
+            )
+            dt_phys = st.number_input(
+                "Δt (s)", 
+                min_value=1e-12, 
+                max_value=1e-5, 
+                value=float(sim.dt_phys), 
+                format="%.2e",
+                help="Time step. Must satisfy CFL stability condition"
+            )
+            c_epsilon_eq = st.number_input(
+                "c_ε^eq", 
+                min_value=0.50, 
+                max_value=0.61, 
+                value=float(sim.c_epsilon_eq), 
+                step=0.005,
+                help="Equilibrium Co fraction in HCP phase"
+            )
         
         st.caption("Phase-dependent mobilities for diffusion equation")
         col_m1, col_m2 = st.columns(2)
         with col_m1:
-            M_gamma_phys = st.number_input("M_γ (m⁵/J·s)", 1e-25, 1e-17, float(sim.M_gamma), format="%.2e")
+            M_gamma_phys = st.number_input(
+                "M_γ (m⁵/J·s)", 
+                min_value=1e-28, 
+                max_value=1e-15, 
+                value=float(sim.M_gamma), 
+                format="%.2e",
+                help="Chemical mobility in FCC phase"
+            )
         with col_m2:
-            M_epsilon_phys = st.number_input("M_ε (m⁵/J·s)", 1e-25, 1e-17, float(sim.M_epsilon), format="%.2e")
+            M_epsilon_phys = st.number_input(
+                "M_ε (m⁵/J·s)", 
+                min_value=1e-28, 
+                max_value=1e-15, 
+                value=float(sim.M_epsilon), 
+                format="%.2e",
+                help="Chemical mobility in HCP phase (typically 0.8× M_γ)"
+            )
         
         if st.button("Apply Parameters", use_container_width=True):
             sim.set_physical_parameters(
@@ -935,12 +1004,16 @@ def main():
                 driving_force_Jmol=driving_force,
                 c_epsilon_eq=c_epsilon_eq
             )
+            st.success("✓ Parameters applied successfully")
             st.rerun()
         
+        # Interface width warning/info
         if xi_eta_nm < 1.5:
             st.warning(f"⚠️ Interface width ({xi_eta_nm:.2f} nm) < 1.5 nm: under-resolved")
         elif xi_eta_nm > 15.0:
             st.info(f"ℹ️ Interface width ({xi_eta_nm:.1f} nm) is quite diffuse")
+        else:
+            st.success(f"✓ Interface width ({xi_eta_nm:.2f} nm) well-resolved")
         
         st.divider()
         
@@ -1452,5 +1525,6 @@ if __name__ == "__main__":
     print(f"   Gradient energy: ONLY on η (NO term on c)")
     print(f"   Domain: 250 μm × 250 μm | Grid: 512×512 | dx ≈ 0.49 μm")
     print(f"   Initialization: HCP precipitate with r_eq > 10ξ guarantee")
+    print(f"   FIXED: Adaptive parameter ranges to prevent StreamlitValueAboveMaxError")
     
     main()
