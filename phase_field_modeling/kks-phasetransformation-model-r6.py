@@ -13,7 +13,7 @@
 #   - Gradient energy ONLY on η (NO κ_c|∇c|² term) - interface regularized by η alone
 #   - All Numba functions use type inference (no explicit scalar signatures)
 #   - Improved initialization: 250 μm domain, 4 geometries, r_eq > 10ξ guarantee
-#   - FIXED: Adaptive parameter ranges to prevent StreamlitValueAboveMaxError
+#   - FIXED: Adaptive parameter ranges with value clamping to prevent Streamlit errors
 # =============================================================================
 
 import numpy as np
@@ -907,25 +907,38 @@ def main():
         st.caption("Physical parameters for phase transformation")
         
         # FIXED: Calculate adaptive ranges based on current simulation state
-        # This prevents StreamlitValueAboveMaxError when kappa_eta exceeds hardcoded limits
-        xi_eta_nm = sim.scales.phys_to_interface_width(sim.kappa_eta, sim.W_phys) * 1e9
+        # This prevents StreamlitValueAboveMaxError and StreamlitValueBelowMinError
+        # by ensuring the current value is ALWAYS within the min/max bounds
+        
+        dx_phys = sim.domain_size_um * 1e-6 / sim.nx  # ≈ 4.88e-7 m for 250μm/512
         
         # Calculate safe adaptive ranges for kappa_eta based on current W_phys
-        # κ_η = ξ² × W, where ξ can range from 3×dx to 12×dx
-        dx_phys = sim.domain_size_um * 1e-6 / sim.nx  # ≈ 4.88e-7 m for 250μm/512
-        kappa_eta_min_safe = (3.0 * dx_phys)**2 * sim.W_phys * 0.1  # 10% below minimum
-        kappa_eta_max_safe = (15.0 * dx_phys)**2 * sim.W_phys * 10.0  # 10× above maximum for safety
+        # κ_η = ξ² × W, where ξ can range from 3×dx to 15×dx
+        kappa_eta_theoretical_min = (3.0 * dx_phys)**2 * sim.W_phys
+        kappa_eta_theoretical_max = (15.0 * dx_phys)**2 * sim.W_phys
         
-        # Ensure we don't go below physical minimums
-        kappa_eta_min_safe = max(kappa_eta_min_safe, 1e-15)
-        kappa_eta_max_safe = min(kappa_eta_max_safe, 1e-3)  # Cap at reasonable maximum
+        # EXPAND range to always include current sim.kappa_eta value
+        # This is the KEY FIX for StreamlitValueBelowMinError
+        kappa_eta_min_safe = min(kappa_eta_theoretical_min, sim.kappa_eta * 0.01)
+        kappa_eta_max_safe = max(kappa_eta_theoretical_max, sim.kappa_eta * 100.0)
+        
+        # Apply absolute physical bounds to prevent extreme values
+        kappa_eta_min_safe = max(kappa_eta_min_safe, 1e-20)
+        kappa_eta_max_safe = min(kappa_eta_max_safe, 1e-2)
+        
+        # CRITICAL: Clip the current value to be within the range
+        # This guarantees value is never below min or above max
+        kappa_eta_current = float(sim.kappa_eta)
+        kappa_eta_current = np.clip(kappa_eta_current, kappa_eta_min_safe, kappa_eta_max_safe)
+        
+        xi_eta_nm = sim.scales.phys_to_interface_width(sim.kappa_eta, sim.W_phys) * 1e9
         
         col_p1, col_p2 = st.columns(2)
         with col_p1:
             W_phys = st.number_input(
                 "W (J/m³)", 
                 min_value=1e4, 
-                max_value=1e10, 
+                max_value=1e12, 
                 value=float(sim.W_phys), 
                 format="%.2e",
                 help="Double-well barrier height. Typical: 1e7-1e8 J/m³"
@@ -934,9 +947,9 @@ def main():
                 "κ_η (J/m) [ONLY on η]", 
                 min_value=float(kappa_eta_min_safe), 
                 max_value=float(kappa_eta_max_safe), 
-                value=float(sim.kappa_eta), 
+                value=float(kappa_eta_current), 
                 format="%.2e",
-                help=f"Gradient coefficient. Auto-range: {kappa_eta_min_safe:.2e} to {kappa_eta_max_safe:.2e} J/m"
+                help=f"Gradient coefficient. Range: {kappa_eta_min_safe:.2e} to {kappa_eta_max_safe:.2e} J/m (auto-adjusted to include current value)"
             )
             driving_force = st.number_input(
                 "ΔG (J/mol)", 
@@ -950,16 +963,16 @@ def main():
             L_eta_phys = st.number_input(
                 "L_η (m³/J·s)", 
                 min_value=1e-15, 
-                max_value=1e-5, 
-                value=float(sim.L_struct), 
+                max_value=1e-3, 
+                value=float(np.clip(sim.L_struct, 1e-15, 1e-3)), 
                 format="%.2e",
                 help="Allen-Cahn mobility. Typically 10-100× larger than M"
             )
             dt_phys = st.number_input(
                 "Δt (s)", 
                 min_value=1e-12, 
-                max_value=1e-5, 
-                value=float(sim.dt_phys), 
+                max_value=1e-4, 
+                value=float(np.clip(sim.dt_phys, 1e-12, 1e-4)), 
                 format="%.2e",
                 help="Time step. Must satisfy CFL stability condition"
             )
@@ -967,7 +980,7 @@ def main():
                 "c_ε^eq", 
                 min_value=0.50, 
                 max_value=0.61, 
-                value=float(sim.c_epsilon_eq), 
+                value=float(np.clip(sim.c_epsilon_eq, 0.50, 0.61)), 
                 step=0.005,
                 help="Equilibrium Co fraction in HCP phase"
             )
@@ -977,18 +990,18 @@ def main():
         with col_m1:
             M_gamma_phys = st.number_input(
                 "M_γ (m⁵/J·s)", 
-                min_value=1e-28, 
-                max_value=1e-15, 
-                value=float(sim.M_gamma), 
+                min_value=1e-30, 
+                max_value=1e-12, 
+                value=float(np.clip(sim.M_gamma, 1e-30, 1e-12)), 
                 format="%.2e",
                 help="Chemical mobility in FCC phase"
             )
         with col_m2:
             M_epsilon_phys = st.number_input(
                 "M_ε (m⁵/J·s)", 
-                min_value=1e-28, 
-                max_value=1e-15, 
-                value=float(sim.M_epsilon), 
+                min_value=1e-30, 
+                max_value=1e-12, 
+                value=float(np.clip(sim.M_epsilon, 1e-30, 1e-12)), 
                 format="%.2e",
                 help="Chemical mobility in HCP phase (typically 0.8× M_γ)"
             )
@@ -1525,6 +1538,6 @@ if __name__ == "__main__":
     print(f"   Gradient energy: ONLY on η (NO term on c)")
     print(f"   Domain: 250 μm × 250 μm | Grid: 512×512 | dx ≈ 0.49 μm")
     print(f"   Initialization: HCP precipitate with r_eq > 10ξ guarantee")
-    print(f"   FIXED: Adaptive parameter ranges to prevent StreamlitValueAboveMaxError")
+    print(f"   FIXED: Adaptive parameter ranges with value clamping to prevent Streamlit errors")
     
     main()
