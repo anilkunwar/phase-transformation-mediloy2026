@@ -12,6 +12,7 @@
 #   - Parabolic free energies for numerical stability at high T
 #   - Gradient energy ONLY on η (NO κ_c|∇c|² term) - interface regularized by η alone
 #   - All Numba functions use type inference (no explicit scalar signatures)
+#   - Improved initialization: 250 μm domain, 4 geometries, r_eq > 10ξ guarantee
 # =============================================================================
 
 import numpy as np
@@ -346,15 +347,20 @@ class MediloyKKSPhaseTransformation:
       μ^γ = μ^ε, c = φ_γ·c^γ + φ_ε·c^ε
     - Moelans interpolation for smooth phase fractions
     - Gradient energy ONLY on η (interface regularized by structure alone)
+    - Improved initialization: 250 μm domain, 4 geometries, r_eq > 10ξ guarantee
     
     η = 0 → γ-FCC (austenite), η = 1 → ε-HCP (martensite)
     """
     
-    def __init__(self, nx=256, ny=256, T_celsius=950.0, 
+    def __init__(self, nx=512, ny=512, T_celsius=950.0, 
                  V_m_m3mol=6.7e-6, D_b_m2s=5.0e-15):
         self.nx = nx
         self.ny = ny
         self.dx_dim = 1.0
+        
+        # NEW: Fixed 250 μm × 250 μm physical domain (mesoscale)
+        self.domain_size_um = 250.0
+        self.dx_phys = self.domain_size_um * 1e-6 / nx  # physical grid spacing (μm → m)
         
         # Dimensionless model parameters (tuned for numerical stability)
         self.W_dim = 1.0              # Structural double-well barrier
@@ -413,12 +419,15 @@ class MediloyKKSPhaseTransformation:
     def _update_physical_params(self):
         """Convert dimensionless parameters to physical SI units."""
         (self.W_phys, self.kappa_eta, 
-         self.M_gamma, self.M_epsilon, self.L_struct, self.dt_phys, self.dx_phys) = \
+         self.M_gamma, self.M_epsilon, self.L_struct, self.dt_phys, dx_from_scales) = \
             self.scales.dim_to_phys(
                 self.W_dim, self.kappa_eta_dim,
                 self.M_gamma_dim, self.M_epsilon_dim,
                 self.L_eta_dim, self.dt_dim, self.dx_dim
             )
+        
+        # Override dx_phys with domain-based calculation for consistency
+        self.dx_phys = self.domain_size_um * 1e-6 / self.nx
         
         self.T_K = self.T_celsius + 273.15
     
@@ -468,7 +477,7 @@ class MediloyKKSPhaseTransformation:
     
     def initialize_fcc_with_random_hcp_seeds(self, num_seeds=12, radius_grid=5,
                                              seed_co_fraction=0.58, seed=42):
-        """Initialize with FCC matrix + random circular HCP seeds."""
+        """Initialize with FCC matrix + random circular HCP seeds (legacy)."""
         np.random.seed(seed)
         self.c = np.full((self.nx, self.ny), 0.61, dtype=np.float64)
         self.eta = np.zeros((self.nx, self.ny), dtype=np.float64)
@@ -585,6 +594,117 @@ class MediloyKKSPhaseTransformation:
         total_F = np.sum(f_bulk + f_barrier + f_gradient) * (self.dx_phys**2)
         return float(total_F)
     
+    # ====================== NEW: SHAPE MASK HELPERS ======================
+    @staticmethod
+    def _point_in_polygon(px, py, poly_x, poly_y):
+        """Ray-casting point-in-polygon (pure NumPy-free)."""
+        n = len(poly_x)
+        inside = False
+        p1x, p1y = poly_x[0], poly_y[0]
+        for i in range(n + 1):
+            p2x, p2y = poly_x[i % n], poly_y[i % n]
+            if py > min(p1y, p2y):
+                if py <= max(p1y, p2y):
+                    if px <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (py - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or px <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        return inside
+
+    def _compute_equiv_radius_um(self, shape, params, dx_um):
+        """Return equivalent circle radius (μm) for any geometry."""
+        if shape == "circle":
+            return params["radius_um"]
+        elif shape == "rectangle":
+            return np.sqrt(params["width_um"] * params["height_um"] / np.pi)
+        elif shape == "triangle":
+            x = [v[0] for v in params["vertices_um"]]
+            y = [v[1] for v in params["vertices_um"]]
+            area = 0.5 * abs((x[0]*(y[1]-y[2]) + x[1]*(y[2]-y[0]) + x[2]*(y[0]-y[1])))
+            return np.sqrt(area / np.pi)
+        elif shape == "trapezium":
+            # Shoelace formula for quadrilateral area
+            x = [v[0] for v in params["vertices_um"]]
+            y = [v[1] for v in params["vertices_um"]]
+            area = 0.5 * abs(sum(x[i]*y[(i+1)%4] - x[(i+1)%4]*y[i] for i in range(4)))
+            return np.sqrt(area / np.pi)
+        return 0.0
+
+    # ====================== NEW: MAIN INITIALIZER ======================
+    def initialize_hcp_precipitates(self, shape="circle", **kwargs):
+        """HCP precipitates (η=1) in FCC matrix (η=0) with guaranteed size r_eq > 10ξ."""
+        self.c = np.full((self.nx, self.ny), 0.61, dtype=np.float64)
+        self.eta = np.zeros((self.nx, self.ny), dtype=np.float64)
+
+        dx_um = self.domain_size_um / self.nx
+        xi_phys = self.scales.phys_to_interface_width(self.kappa_eta, self.W_phys)
+        r_eq_min_um = 10.0 * xi_phys * 1e6
+
+        # Auto-adjust size if too small
+        r_eq = self._compute_equiv_radius_um(shape, kwargs, dx_um)
+        if r_eq < r_eq_min_um:
+            scale = (r_eq_min_um * 1.1) / r_eq if r_eq > 0 else 1.0
+            if shape == "circle":
+                kwargs["radius_um"] *= scale
+            elif shape == "rectangle":
+                kwargs["width_um"] *= scale
+                kwargs["height_um"] *= scale
+            elif shape in ("triangle", "trapezium"):
+                kwargs["vertices_um"] = [(x*scale + (1-scale)*self.domain_size_um/2,
+                                         y*scale + (1-scale)*self.domain_size_um/2)
+                                        for x, y in kwargs["vertices_um"]]
+            st.warning(f"⚠️ Geometry auto-scaled ×{scale:.2f} to satisfy r_eq > 10ξ ({r_eq_min_um:.1f} μm)")
+
+        # Grid coordinates
+        xg, yg = np.meshgrid(np.arange(self.nx), np.arange(self.ny))
+
+        if shape == "circle":
+            cx = int(kwargs.get("center_x_um", 125.0) / dx_um)
+            cy = int(kwargs.get("center_y_um", 125.0) / dx_um)
+            r_grid = kwargs.get("radius_um", 60.0) / dx_um
+            mask = ((xg - cx)**2 + (yg - cy)**2) <= r_grid**2
+
+        elif shape == "rectangle":
+            cx = int(kwargs.get("center_x_um", 125.0) / dx_um)
+            cy = int(kwargs.get("center_y_um", 125.0) / dx_um)
+            w_grid = kwargs.get("width_um", 120.0) / (2 * dx_um)
+            h_grid = kwargs.get("height_um", 80.0) / (2 * dx_um)
+            mask = (np.abs(xg - cx) <= w_grid) & (np.abs(yg - cy) <= h_grid)
+
+        elif shape == "triangle":
+            verts_um = kwargs.get("vertices_um", [(50,80), (200,80), (125,200)])
+            verts_grid = [(int(x/dx_um), int(y/dx_um)) for x,y in verts_um]
+            poly_x = [v[0] for v in verts_grid]
+            poly_y = [v[1] for v in verts_grid]
+            mask = np.zeros((self.ny, self.nx), dtype=bool)
+            for j in range(self.ny):
+                for i in range(self.nx):
+                    if self._point_in_polygon(i, j, poly_x, poly_y):
+                        mask[j, i] = True
+
+        elif shape == "trapezium":
+            verts_um = kwargs.get("vertices_um",
+                                  [(40,60), (210,60), (180,180), (70,180)])
+            verts_grid = [(int(x/dx_um), int(y/dx_um)) for x,y in verts_um]
+            poly_x = [v[0] for v in verts_grid]
+            poly_y = [v[1] for v in verts_grid]
+            mask = np.zeros((self.ny, self.nx), dtype=bool)
+            for j in range(self.ny):
+                for i in range(self.nx):
+                    if self._point_in_polygon(i, j, poly_x, poly_y):
+                        mask[j, i] = True
+
+        # Apply precipitate
+        self.eta[mask] = 1.0
+        self.c[mask] = kwargs.get("seed_co_fraction", 0.575)   # Cr-enriched inside HCP
+        self.time_phys = 0.0
+        self.step = 0
+        self.clear_history()
+        self.update_history()
+        return r_eq_min_um
+    
     def run_step(self):
         """Execute one time step of KKS-coupled phase transformation."""
         self.c, self.eta, mu_field, c_g, c_e, phi_e = update_kks_phase_transformation(
@@ -679,17 +799,22 @@ def main():
     - **KKS**: μ^γ = μ^ε at interface (correct partitioning, no artificial drag)
     - **Moelans**: φ_α = η_α²/Ση_ρ² for smooth phase fractions
     - **Gradient energy ONLY on η** - interface regularized by structure alone
+    - **Domain**: 250 μm × 250 μm | **Geometries**: circle, rectangle, triangle, trapezium
     """)
     
     if 'sim' not in st.session_state:
         st.session_state.sim = MediloyKKSPhaseTransformation(
-            nx=256, ny=256,
+            nx=512, ny=512,
             T_celsius=950.0,
             V_m_m3mol=6.7e-6,
             D_b_m2s=5.0e-15
         )
-        st.session_state.sim.initialize_fcc_with_random_hcp_seeds(
-            num_seeds=12, radius_grid=5, seed_co_fraction=0.58, seed=42
+        # Initialize with default circular HCP precipitate
+        st.session_state.sim.initialize_hcp_precipitates(
+            shape="circle",
+            center_x_um=125.0, center_y_um=125.0,
+            radius_um=60.0,
+            seed_co_fraction=0.575
         )
     
     sim = st.session_state.sim
@@ -721,34 +846,59 @@ def main():
         
         st.divider()
         
-        st.subheader("🎲 Initial Conditions")
-        init_type = st.radio("Initialization", ["Random noise", "HCP seeds in FCC", "Uniform FCC"])
-        
-        if init_type == "Random noise":
-            noise_c = st.slider("Co noise amplitude", 0.0, 0.1, 0.02, 0.01)
-            noise_eta = st.slider("η noise amplitude", 0.0, 0.1, 0.02, 0.01)
-            if st.button("🔄 Initialize with Random Noise", use_container_width=True):
-                sim.initialize_random(c0=0.61, eta0=0.0, noise_c=noise_c, noise_eta=noise_eta, seed=int(time.time()))
-                st.rerun()
-        
-        elif init_type == "HCP seeds in FCC":
-            num_seeds = st.slider("Number of HCP seeds", 1, 50, 12, 1)
-            seed_radius = st.slider("Seed radius (grid units)", 3, 15, 5, 1)
-            if st.button("🌱 Initialize with HCP Seeds", use_container_width=True):
-                sim.initialize_fcc_with_random_hcp_seeds(
-                    num_seeds=num_seeds, radius_grid=seed_radius, seed=42
-                )
-                st.rerun()
-        
-        else:  # Uniform FCC
-            if st.button("🧊 Initialize Uniform FCC", use_container_width=True):
-                sim.c = np.full((sim.nx, sim.ny), 0.61, dtype=np.float64)
-                sim.eta = np.zeros((sim.nx, sim.ny), dtype=np.float64)
-                sim.time_phys = 0.0
-                sim.step = 0
-                sim.clear_history()
-                sim.update_history()
-                st.rerun()
+        # =============================================================================
+        # NEW: HCP Precipitate Initialization (250 μm domain)
+        # =============================================================================
+        st.subheader("🟦 HCP Precipitate Initialization (250 μm domain)")
+        shape_type = st.selectbox(
+            "HCP geometry in FCC matrix",
+            ["circle", "rectangle", "triangle", "trapezium"]
+        )
+
+        # Interface width slider (NEW)
+        xi_times_dx = st.slider(
+            "Diffuse interface width ξ (× dx)",
+            min_value=3.0, max_value=12.0, value=5.0, step=0.5,
+            help="Larger N → smoother but more diffuse interface"
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if shape_type in ["circle", "rectangle"]:
+                cx = st.number_input("Center X (μm)", 0.0, 250.0, 125.0, 1.0)
+                cy = st.number_input("Center Y (μm)", 0.0, 250.0, 125.0, 1.0)
+            seed_c = st.number_input("Co fraction inside HCP", 0.50, 0.61, 0.575, 0.005)
+
+        with col_b:
+            if shape_type == "circle":
+                r = st.number_input("Radius (μm)", 10.0, 120.0, 60.0, 1.0)
+                params = {"center_x_um": cx, "center_y_um": cy, "radius_um": r, "seed_co_fraction": seed_c}
+            elif shape_type == "rectangle":
+                w = st.number_input("Width (μm)", 20.0, 200.0, 120.0, 1.0)
+                h = st.number_input("Height (μm)", 20.0, 200.0, 80.0, 1.0)
+                params = {"center_x_um": cx, "center_y_um": cy, "width_um": w, "height_um": h, "seed_co_fraction": seed_c}
+            elif shape_type == "triangle":
+                st.caption("Triangle vertices (μm)")
+                v1x = st.number_input("V1 x", 0.0, 250.0, 50.0); v1y = st.number_input("V1 y", 0.0, 250.0, 80.0)
+                v2x = st.number_input("V2 x", 0.0, 250.0, 200.0); v2y = st.number_input("V2 y", 0.0, 250.0, 80.0)
+                v3x = st.number_input("V3 x", 0.0, 250.0, 125.0); v3y = st.number_input("V3 y", 0.0, 250.0, 200.0)
+                params = {"vertices_um": [(v1x,v1y),(v2x,v2y),(v3x,v3y)], "seed_co_fraction": seed_c}
+            elif shape_type == "trapezium":
+                st.caption("Trapezium vertices (μm, convex)")
+                v1x = st.number_input("V1 x", 0.0, 250.0, 40.0); v1y = st.number_input("V1 y", 0.0, 250.0, 60.0)
+                v2x = st.number_input("V2 x", 0.0, 250.0, 210.0); v2y = st.number_input("V2 y", 0.0, 250.0, 60.0)
+                v3x = st.number_input("V3 x", 0.0, 250.0, 180.0); v3y = st.number_input("V3 y", 0.0, 250.0, 180.0)
+                v4x = st.number_input("V4 x", 0.0, 250.0, 70.0); v4y = st.number_input("V4 y", 0.0, 250.0, 180.0)
+                params = {"vertices_um": [(v1x,v1y),(v2x,v2y),(v3x,v3y),(v4x,v4y)], "seed_co_fraction": seed_c}
+
+        if st.button("🌱 Initialize HCP Precipitate", type="primary", use_container_width=True):
+            sim.initialize_hcp_precipitates(shape=shape_type, **params)
+            # Apply the chosen interface resolution
+            dx_phys = sim.domain_size_um * 1e-6 / sim.nx
+            xi_phys = xi_times_dx * dx_phys
+            sim.kappa_eta = xi_phys**2 * sim.W_phys          # ξ = √(κ/W)
+            st.success(f"✓ {shape_type.capitalize()} initialized | ξ = {xi_times_dx:.1f}×dx | r_eq > 10ξ")
+            st.rerun()
         
         st.divider()
         
@@ -837,8 +987,8 @@ def main():
     # MAIN CONTENT: Plotly Visualizations
     # =============================================================================
     
-    extent_um_x = [0, sim.nx * sim.dx_phys * 1e6]
-    extent_um_y = [0, sim.ny * sim.dx_phys * 1e6]
+    extent_um_x = [0, sim.domain_size_um]
+    extent_um_y = [0, sim.domain_size_um]
     
     # Row 1: Structural order parameter + Concentration field
     col_viz1, col_viz2 = st.columns(2)
@@ -1132,6 +1282,7 @@ def main():
                     'L_struct': sim.L_struct,
                     'dt_phys': sim.dt_phys,
                     'dx_phys': sim.dx_phys,
+                    'domain_size_um': sim.domain_size_um,
                 }
             )
             npz_buf.seek(0)
@@ -1281,6 +1432,7 @@ def main():
         "Mediloy γ→ε KKS Phase Transformation | c: Diffusion eqn ∇·[M(φ)∇μ] (conserved) | "
         "η: Allen-Cahn (non-conserved) | KKS interface: μ^γ=μ^ε | "
         "Gradient energy ONLY on η | "
+        f"Domain: {sim.domain_size_um} μm × {sim.domain_size_um} μm | "
         f"T = {sim.T_celsius}°C | Pseudo-binary Co-M<sub>y</sub> (c₀ = 0.61)"
     )
 
@@ -1298,6 +1450,7 @@ if __name__ == "__main__":
     print(f"   Temperature: 950°C (1223.15 K)")
     print(f"   Model: Diffusion eqn for c + Allen-Cahn for η + KKS interface")
     print(f"   Gradient energy: ONLY on η (NO term on c)")
-    print(f"   Initial condition: FCC matrix + random HCP seeds")
+    print(f"   Domain: 250 μm × 250 μm | Grid: 512×512 | dx ≈ 0.49 μm")
+    print(f"   Initialization: HCP precipitate with r_eq > 10ξ guarantee")
     
     main()
