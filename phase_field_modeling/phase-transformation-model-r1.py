@@ -3,14 +3,15 @@
 # γ-FCC → ε-HCP Martensitic Transformation in Co-Cr-Mo Dental Alloys
 # Temperature: 950°C (1223.15 K) - Pseudo-binary Co-M_y model
 # =============================================================================
-# Fixes:
+# Fixes Applied:
 #   - dt_phys slider max_value increased to 1e-5 (was 1e-6)
 #   - D_b_exp slider min/max changed to floats (-17.0, -13.0)
 #   - compute_total_free_energy: vectorized to avoid Numba TypingError
+#   - Added explicit type signatures for all Numba functions
 # =============================================================================
 
 import numpy as np
-from numba import njit, prange
+from numba import njit, float64, int64, prange
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -183,11 +184,14 @@ class PhysicalScalesMediloy:
 # NUMBA-ACCELERATED KERNELS: Hybrid Cahn-Hilliard + Allen-Cahn
 # =============================================================================
 
-@njit(fastmath=True, cache=True)
+# --- Explicit signatures for all Numba functions ---
+
+@njit(float64(float64, float64, float64, float64), fastmath=True, cache=True)
 def chemical_free_energy_density(c, T_K, Omega_Jmol, V_m):
     """
     Regular solution model for Co-M_y pseudo-binary alloy.
     
+    Formula:
     f_chem(c) = (RT/V_m)[c·ln(c) + (1-c)·ln(1-c)] + (Ω/V_m)·c·(1-c)
     
     Parameters:
@@ -210,11 +214,12 @@ def chemical_free_energy_density(c, T_K, Omega_Jmol, V_m):
     return f_mix + f_excess
 
 
-@njit(fastmath=True, cache=True)
+@njit(float64(float64, float64, float64, float64), fastmath=True, cache=True)
 def d_fchem_dc(c, T_K, Omega_Jmol, V_m):
     """
     Chemical potential contribution: ∂f_chem/∂c
     
+    Formula:
     μ_chem = (RT/V_m)·ln[c/(1-c)] + (Ω/V_m)·(1-2c)
     
     Parameters:
@@ -235,12 +240,14 @@ def d_fchem_dc(c, T_K, Omega_Jmol, V_m):
     return mu_mix + mu_excess
 
 
-@njit(fastmath=True, cache=True)
+@njit(float64(float64, float64), fastmath=True, cache=True)
 def structural_free_energy(eta, W_struct):
     """
     Double-well potential for structural order parameter.
     
+    Formula:
     f_struct(η) = W·η²(1-η)²
+    
     - η = 0: FCC (γ) phase (metastable at 950°C)
     - η = 1: HCP (ε) phase (stable at 950°C)
     
@@ -256,11 +263,12 @@ def structural_free_energy(eta, W_struct):
     return W_struct * eta**2 * (1.0 - eta)**2
 
 
-@njit(fastmath=True, cache=True)
+@njit(float64(float64, float64), fastmath=True, cache=True)
 def d_fstruct_deta(eta, W_struct):
     """
     Variational derivative: ∂f_struct/∂η
     
+    Formula:
     ∂f/∂η = 2W·η(1-η)(1-2η) = 2W·η - 6W·η² + 4W·η³
     
     Parameters:
@@ -275,11 +283,12 @@ def d_fstruct_deta(eta, W_struct):
     return 2.0 * W_struct * eta * (1.0 - eta) * (1.0 - 2.0 * eta)
 
 
-@njit(fastmath=True, cache=True)
+@njit(float64(float64, float64, float64), fastmath=True, cache=True)
 def coupling_free_energy(c, eta, lambda_coup):
     """
     Coupling term: HCP phase stabilized by higher M_y (lower Co) content.
     
+    Formula:
     f_coup = -λ·(1-c)·η²
     
     This term:
@@ -299,26 +308,26 @@ def coupling_free_energy(c, eta, lambda_coup):
     return -lambda_coup * (1.0 - c) * eta**2
 
 
-@njit(fastmath=True, cache=True)
+@njit(float64(float64, float64, float64), fastmath=True, cache=True)
 def d_fcoup_dc(c, eta, lambda_coup):
     """∂f_coup/∂c = +λ·η²"""
     return lambda_coup * eta**2
 
 
-@njit(fastmath=True, cache=True)
+@njit(float64(float64, float64, float64), fastmath=True, cache=True)
 def d_fcoup_deta(c, eta, lambda_coup):
     """∂f_coup/∂η = -2λ·(1-c)·η"""
     return -2.0 * lambda_coup * (1.0 - c) * eta
 
 
-@njit(fastmath=True, parallel=True)
+@njit(float64[:,:](float64[:,:], float64), parallel=True, fastmath=True, cache=True)
 def compute_laplacian_2d(field, dx):
     """
     Compute 5-point stencil Laplacian with periodic BCs.
-    ∇²f ≈ [f(i+1,j) + f(i-1,j) + f(i,j+1) + f(i,j-1) - 4f(i,j)] / dx²
+    Formula: ∇²f ≈ [f(i+1,j) + f(i-1,j) + f(i,j+1) + f(i,j-1) - 4f(i,j)] / dx²
     """
     nx, ny = field.shape
-    lap = np.zeros_like(field)
+    lap = np.empty_like(field)
     
     for i in prange(nx):
         for j in prange(ny):
@@ -333,14 +342,14 @@ def compute_laplacian_2d(field, dx):
     return lap
 
 
-@njit(fastmath=True, parallel=True)
+@njit(float64[:,:](float64[:,:], float64[:,:], float64), parallel=True, fastmath=True, cache=True)
 def compute_gradient_divergence_2d(flux_x, flux_y, dx):
     """
     Compute divergence of vector field: ∇·J = ∂Jx/∂x + ∂Jy/∂y
     Using central differences with periodic BCs.
     """
     nx, ny = flux_x.shape
-    div = np.zeros_like(flux_x)
+    div = np.empty_like(flux_x)
     
     for i in prange(nx):
         for j in prange(ny):
@@ -355,13 +364,17 @@ def compute_gradient_divergence_2d(flux_x, flux_y, dx):
     return div
 
 
-@njit(fastmath=True, parallel=True)
+@njit(
+    (float64[:,:], float64[:,:], float64, float64, float64, float64, float64, float64,
+     float64, float64, float64, float64, float64, float64),
+    parallel=True, fastmath=True, cache=True
+)
 def update_mediloy_hybrid(c, eta, dt, dx, kappa_c, kappa_eta, M_chem, L_struct,
                           T_K, Omega_Jmol, V_m, W_struct, lambda_coup):
     """
     One time step of hybrid Cahn-Hilliard (concentration) + Allen-Cahn (structure).
     
-    Governing equations:
+    Governing Equations (Formulas):
     ∂c/∂t = ∇·[ M_chem ∇( δF/δc ) ]          (Cahn-Hilliard, conserved)
     ∂η/∂t = -L_struct · ( δF/δη )             (Allen-Cahn, non-conserved)
     
@@ -394,7 +407,7 @@ def update_mediloy_hybrid(c, eta, dt, dx, kappa_c, kappa_eta, M_chem, L_struct,
     
     # ========== CONCENTRATION FIELD (Cahn-Hilliard) ==========
     # Compute chemical potential μ = δF/δc = ∂f/∂c - κ_c·∇²c
-    mu_chem = np.zeros_like(c)
+    mu_chem = np.empty_like(c)
     for i in prange(nx):
         for j in prange(ny):
             # Local chemical potential from bulk free energy
@@ -407,8 +420,8 @@ def update_mediloy_hybrid(c, eta, dt, dx, kappa_c, kappa_eta, M_chem, L_struct,
             mu_chem[i, j] = mu_bulk + mu_coup + mu_grad
     
     # Compute flux: J = -M·∇μ (Fick's law with gradient energy)
-    flux_c_x = np.zeros_like(c)
-    flux_c_y = np.zeros_like(c)
+    flux_c_x = np.empty_like(c)
+    flux_c_y = np.empty_like(c)
     for i in prange(nx):
         for j in prange(ny):
             ip1 = (i + 1) % nx
@@ -428,7 +441,7 @@ def update_mediloy_hybrid(c, eta, dt, dx, kappa_c, kappa_eta, M_chem, L_struct,
     
     # ========== STRUCTURAL ORDER PARAMETER (Allen-Cahn) ==========
     # Compute variational derivative: δF/δη = ∂f/∂η - κ_η·∇²η
-    dF_deta = np.zeros_like(eta)
+    dF_deta = np.empty_like(eta)
     for i in prange(nx):
         for j in prange(ny):
             # Structural contribution
