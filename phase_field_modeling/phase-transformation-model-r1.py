@@ -3,7 +3,7 @@
 # γ-FCC → ε-HCP Martensitic Transformation in Co-Cr-Mo Dental Alloys
 # Temperature: 950°C (1223.15 K) - Pseudo-binary Co-M_y model
 # =============================================================================
-# Fixes Applied:
+# Fixes:
 #   - dt_phys slider max_value increased to 1e-5 (was 1e-6)
 #   - D_b_exp slider min/max changed to floats (-17.0, -13.0)
 #   - compute_total_free_energy: vectorized to avoid Numba TypingError
@@ -185,13 +185,11 @@ class PhysicalScalesMediloy:
 # =============================================================================
 
 # --- Explicit signatures for all Numba functions ---
-
 @njit(float64(float64, float64, float64, float64), fastmath=True, cache=True)
 def chemical_free_energy_density(c, T_K, Omega_Jmol, V_m):
     """
     Regular solution model for Co-M_y pseudo-binary alloy.
     
-    Formula:
     f_chem(c) = (RT/V_m)[c·ln(c) + (1-c)·ln(1-c)] + (Ω/V_m)·c·(1-c)
     
     Parameters:
@@ -219,7 +217,6 @@ def d_fchem_dc(c, T_K, Omega_Jmol, V_m):
     """
     Chemical potential contribution: ∂f_chem/∂c
     
-    Formula:
     μ_chem = (RT/V_m)·ln[c/(1-c)] + (Ω/V_m)·(1-2c)
     
     Parameters:
@@ -245,9 +242,7 @@ def structural_free_energy(eta, W_struct):
     """
     Double-well potential for structural order parameter.
     
-    Formula:
     f_struct(η) = W·η²(1-η)²
-    
     - η = 0: FCC (γ) phase (metastable at 950°C)
     - η = 1: HCP (ε) phase (stable at 950°C)
     
@@ -268,7 +263,6 @@ def d_fstruct_deta(eta, W_struct):
     """
     Variational derivative: ∂f_struct/∂η
     
-    Formula:
     ∂f/∂η = 2W·η(1-η)(1-2η) = 2W·η - 6W·η² + 4W·η³
     
     Parameters:
@@ -288,7 +282,6 @@ def coupling_free_energy(c, eta, lambda_coup):
     """
     Coupling term: HCP phase stabilized by higher M_y (lower Co) content.
     
-    Formula:
     f_coup = -λ·(1-c)·η²
     
     This term:
@@ -324,7 +317,7 @@ def d_fcoup_deta(c, eta, lambda_coup):
 def compute_laplacian_2d(field, dx):
     """
     Compute 5-point stencil Laplacian with periodic BCs.
-    Formula: ∇²f ≈ [f(i+1,j) + f(i-1,j) + f(i,j+1) + f(i,j-1) - 4f(i,j)] / dx²
+    ∇²f ≈ [f(i+1,j) + f(i-1,j) + f(i,j+1) + f(i,j-1) - 4f(i,j)] / dx²
     """
     nx, ny = field.shape
     lap = np.empty_like(field)
@@ -374,7 +367,7 @@ def update_mediloy_hybrid(c, eta, dt, dx, kappa_c, kappa_eta, M_chem, L_struct,
     """
     One time step of hybrid Cahn-Hilliard (concentration) + Allen-Cahn (structure).
     
-    Governing Equations (Formulas):
+    Governing equations:
     ∂c/∂t = ∇·[ M_chem ∇( δF/δc ) ]          (Cahn-Hilliard, conserved)
     ∂η/∂t = -L_struct · ( δF/δη )             (Allen-Cahn, non-conserved)
     
