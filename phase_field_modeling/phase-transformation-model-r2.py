@@ -1,15 +1,17 @@
 # =============================================================================
-# MEDILOY γ-FCC → ε-HCP PHASE DECOMPOSITION SIMULATOR (DUAL CAHN-HILLIARD)
-# Both c (Co fraction) AND η (HCP order parameter) evolve via Cahn-Hilliard
+# MEDILOY γ-FCC → ε-HCP PHASE TRANSFORMATION SIMULATOR
+# Mixed Dynamics: c (KKS Diffusion Equation) + η (Allen-Cahn) + KKS Interface Model
 # Temperature: 950°C (1223.15 K) - Pseudo-binary Co-M_y model
 # =============================================================================
 # Key Features:
-#   - η is now a CONSERVED order parameter: ∂η/∂t = ∇·[M_η ∇(δF/δη)]
-#   - c remains conserved: ∂c/∂t = ∇·[M_c ∇(δF/δc)]
-#   - Coupled free energy with solute drag: f_coup = -λ·(1-c)·η²
+#   - η: NON-CONSERVED order parameter → Allen-Cahn: ∂η/∂t = -L·(δF/δη)
+#   - c: CONSERVED concentration → Diffusion equation with KKS:
+#        ∂c/∂t = ∇·[M(φ) ∇μ] where M(φ) = φ_γ·M_γ + φ_ε·M_ε
+#   - KKS model: μ^γ(c^γ) = μ^ε(c^ε) = μ at interface (no artificial solute drag)
+#   - Moelans interpolation: φ_α = η_α² / Ση_ρ² for smooth phase fractions
+#   - Parabolic free energies for numerical stability at high T
+#   - Gradient energy ONLY on η (NO κ_c|∇c|² term) - interface regularized by η alone
 #   - All Numba functions use type inference (no explicit scalar signatures)
-#   - Explicit scalar clipping for nopython compatibility
-#   - Plotly visualizations + Streamlit interactive dashboard
 # =============================================================================
 
 import numpy as np
@@ -24,6 +26,7 @@ from io import BytesIO
 
 # Optional: Uncomment to disable JIT for debugging
 # config.DISABLE_JIT = True
+
 
 # =============================================================================
 # PHYSICAL SCALES FOR MEDILOY (Co-Cr-Mo-Si-W at 950°C)
@@ -40,7 +43,7 @@ class PhysicalScalesMediloy:
     At T = 950°C (1223.15 K):
     - Near equilibrium T0 for γ-FCC ↔ ε-HCP transformation
     - Small chemical driving force: ΔG_chem ≈ 200-600 J/mol
-    - Phase decomposition via conserved dynamics (Cahn-Hilliard)
+    - Phase transformation via coupled diffusion (c) + Allen-Cahn (η) dynamics
     """
     
     def __init__(self, T_celsius=950.0, V_m_m3mol=6.7e-6, D_b_m2s=5.0e-15):
@@ -57,29 +60,32 @@ class PhysicalScalesMediloy:
         self.t0 = self.L0**2 / self.D_b    # s - Diffusion time scale
         self.M0 = self.D_b / self.E0        # m⁵/(J·s) - Chemical mobility scale
         
-        # Structural mobility scale for Cahn-Hilliard η evolution
-        self.M0_eta = self.M0 * 10.0  # m⁵/(J·s) - Typically faster than solute diffusion
+        # Structural mobility scale for Allen-Cahn η evolution (typically faster)
+        self.L0_struct = 1.0e-10      # m³/(J·s) reference for Allen-Cahn mobility
         
-        print(f"Mediloy scales initialized at {self.T_celsius}°C ({self.T:.1f} K)")
+        print(f"Mediloy KKS scales initialized at {self.T_celsius}°C ({self.T:.1f} K)")
         print(f"  L0 = {self.L0*1e9:.2f} nm, t0 = {self.t0:.2e} s")
-        print(f"  E0 = {self.E0:.2e} J/m³, M0_c = {self.M0:.2e} m⁵/(J·s), M0_η = {self.M0_eta:.2e} m⁵/(J·s)")
+        print(f"  E0 = {self.E0:.2e} J/m³, M0 = {self.M0:.2e} m⁵/(J·s), L0_η = {self.L0_struct:.2e} m³/(J·s)")
     
-    def dim_to_phys(self, W_dim, kappa_c_dim, kappa_eta_dim, M_c_dim, M_eta_dim, dt_dim, dx_dim=1.0):
+    def dim_to_phys(self, W_dim, kappa_eta_dim, M_gamma_dim, M_epsilon_dim, L_eta_dim, dt_dim, dx_dim=1.0):
+        """Convert dimensionless parameters to physical SI units."""
         W_phys = W_dim * self.E0
-        kappa_c_phys = kappa_c_dim * self.E0 * self.L0**2
         kappa_eta_phys = kappa_eta_dim * self.E0 * self.L0**2
-        M_c_phys = M_c_dim * self.M0
-        M_eta_phys = M_eta_dim * self.M0_eta
+        M_gamma_phys = M_gamma_dim * self.M0
+        M_epsilon_phys = M_epsilon_dim * self.M0
+        L_eta_phys = L_eta_dim * self.L0_struct  # Allen-Cahn mobility
         dt_phys = dt_dim * self.t0
         dx_phys = dx_dim * self.L0
-        return W_phys, kappa_c_phys, kappa_eta_phys, M_c_phys, M_eta_phys, dt_phys, dx_phys
+        return W_phys, kappa_eta_phys, M_gamma_phys, M_epsilon_phys, L_eta_phys, dt_phys, dx_phys
     
     def phys_to_interface_width(self, kappa_phys, W_phys):
+        """Estimate interface width from gradient coefficient and barrier."""
         if W_phys <= 0 or kappa_phys <= 0:
             return 2.0e-9
         return np.sqrt(kappa_phys / W_phys)
     
     def format_time(self, t_seconds):
+        """Human-readable time formatting."""
         if not np.isfinite(t_seconds) or t_seconds < 0:
             return "0 s"
         if t_seconds < 1e-9: return f"{t_seconds*1e12:.2f} ps"
@@ -92,6 +98,7 @@ class PhysicalScalesMediloy:
         else: return f"{t_seconds/86400:.3f} d"
     
     def format_length(self, L_meters):
+        """Human-readable length formatting."""
         if not np.isfinite(L_meters) or L_meters < 0:
             return "0 nm"
         if L_meters < 1e-10: return f"{L_meters*1e12:.2f} pm"
@@ -100,20 +107,10 @@ class PhysicalScalesMediloy:
         elif L_meters < 1e-3: return f"{L_meters*1e6:.2f} μm"
         elif L_meters < 1.0: return f"{L_meters*1e3:.2f} mm"
         else: return f"{L_meters:.3f} m"
-    
-    def format_energy_density(self, E_Jm3):
-        if not np.isfinite(E_Jm3):
-            return "0 J/m³"
-        if abs(E_Jm3) < 1e3:
-            return f"{E_Jm3:.2e} J/m³"
-        elif abs(E_Jm3) < 1e6:
-            return f"{E_Jm3/1e3:.2f} kJ/m³"
-        else:
-            return f"{E_Jm3/1e6:.2f} MJ/m³"
 
 
 # =============================================================================
-# NUMBA KERNELS – Dual Cahn-Hilliard for c AND η (Mediloy style)
+# NUMBA KERNELS – KKS + Moelans + Mixed Diffusion/Allen-Cahn Dynamics
 # =============================================================================
 
 @njit(fastmath=True, cache=True)
@@ -127,56 +124,47 @@ def _clip_scalar(val, lo, hi):
 
 
 @njit(fastmath=True, cache=True)
-def chemical_free_energy_density(c, T_K, Omega_Jmol, V_m):
+def parabolic_free_energy(c, c_eq, K, E_offset):
     """
-    Regular solution model for Co-M_y pseudo-binary alloy.
+    Parabolic free energy for phase α: f^α(c) = ½K(c - c_eq)² + E_offset
     Works with scalars AND arrays via Numba type inference.
     """
-    R = 8.314462618
-    c_safe = _clip_scalar(c, 1e-8, 1.0 - 1e-8)
-    f_mix = (R * T_K / V_m) * (c_safe * np.log(c_safe) + (1.0 - c_safe) * np.log(1.0 - c_safe))
-    f_excess = (Omega_Jmol / V_m) * c * (1.0 - c)
-    return f_mix + f_excess
+    return 0.5 * K * (c - c_eq)**2 + E_offset
 
 
 @njit(fastmath=True, cache=True)
-def d_fchem_dc(c, T_K, Omega_Jmol, V_m):
-    """Chemical potential: ∂f_chem/∂c"""
-    R = 8.314462618
-    c_safe = _clip_scalar(c, 1e-8, 1.0 - 1e-8)
-    mu_mix = (R * T_K / V_m) * np.log(c_safe / (1.0 - c_safe))
-    mu_excess = (Omega_Jmol / V_m) * (1.0 - 2.0 * c)
-    return mu_mix + mu_excess
+def moelans_phase_fraction(eta_val):
+    """
+    Moelans interpolation for 2-phase system (γ-FCC, ε-HCP).
+    φ_ε = (1-η)² / [η² + (1-η)²], φ_γ = η² / [η² + (1-η)²]
+    Returns (phi_gamma, phi_epsilon).
+    """
+    eta_sq = eta_val * eta_val
+    one_minus_eta_sq = (1.0 - eta_val) * (1.0 - eta_val)
+    S = eta_sq + one_minus_eta_sq
+    if S < 1e-12:
+        return 1.0 if eta_val < 0.5 else 0.0, 0.0 if eta_val < 0.5 else 1.0
+    phi_gamma = eta_sq / S
+    phi_epsilon = one_minus_eta_sq / S
+    return phi_gamma, phi_epsilon
 
 
 @njit(fastmath=True, cache=True)
-def structural_free_energy(eta, W_struct):
-    """Double-well: f_struct(η) = W·η²(1-η)²"""
-    return W_struct * eta**2 * (1.0 - eta)**2
-
-
-@njit(fastmath=True, cache=True)
-def d_fstruct_deta(eta, W_struct):
-    """Variational derivative: ∂f_struct/∂η = 2W·η(1-η)(1-2η)"""
-    return 2.0 * W_struct * eta * (1.0 - eta) * (1.0 - 2.0 * eta)
-
-
-@njit(fastmath=True, cache=True)
-def coupling_free_energy(c, eta, lambda_coup):
-    """Coupling: f_coup = -λ·(1-c)·η² (solute drag)"""
-    return -lambda_coup * (1.0 - c) * eta**2
-
-
-@njit(fastmath=True, cache=True)
-def d_fcoup_dc(c, eta, lambda_coup):
-    """∂f_coup/∂c = +λ·η²"""
-    return lambda_coup * eta**2
-
-
-@njit(fastmath=True, cache=True)
-def d_fcoup_deta(c, eta, lambda_coup):
-    """∂f_coup/∂η = -2λ·(1-c)·η"""
-    return -2.0 * lambda_coup * (1.0 - c) * eta
+def d_phi_epsilon_deta(eta_val):
+    """
+    Derivative ∂φ_ε/∂η for Moelans 2-phase interpolation.
+    Used in Allen-Cahn variational derivative.
+    """
+    eta_sq = eta_val * eta_val
+    one_minus_eta_sq = (1.0 - eta_val) * (1.0 - eta_val)
+    S = eta_sq + one_minus_eta_sq
+    if S < 1e-12:
+        return 0.0
+    # d/dη [(1-η)² / S] = [2(1-η)(-1)·S - (1-η)²·dS/dη] / S²
+    # dS/dη = 2η - 2(1-η) = 4η - 2
+    dS_deta = 4.0 * eta_val - 2.0
+    numerator = -2.0 * (1.0 - eta_val) * S - one_minus_eta_sq * dS_deta
+    return numerator / (S * S)
 
 
 @njit(parallel=True, fastmath=True, cache=True)
@@ -214,36 +202,76 @@ def compute_gradient_divergence_2d(flux_x, flux_y, dx):
 
 
 @njit(parallel=True, fastmath=True, cache=True)
-def update_dual_cahn_hilliard(c, eta, dt, dx, 
-                               kappa_c, kappa_eta, 
-                               M_c, M_eta,
-                               T_K, Omega_Jmol, V_m, 
-                               W_struct, lambda_coup):
+def update_kks_phase_transformation(c, eta, dt, dx,
+                                     K_gamma, K_epsilon,
+                                     c_gamma_eq, c_epsilon_eq,
+                                     E_gamma, E_epsilon,
+                                     W_barrier, kappa_eta, L_struct,
+                                     M_gamma, M_epsilon):
     """
-    One time step of DUAL Cahn-Hilliard evolution:
+    One time step using the KKS diffusion equation for c:
     
-    ∂c/∂t = ∇·[ M_c ∇(δF/δc) ]   (conserved Co concentration)
-    ∂η/∂t = ∇·[ M_η ∇(δF/δη) ]   (conserved HCP order parameter)
+    ∂c/∂t = ∇ · [ M(φ) ∇μ ]
     
-    Free energy: F = ∫[f_chem(c) + f_struct(η) + f_coup(c,η) 
-                       + (κ_c/2)|∇c|² + (κ_η/2)|∇η|²] dV
+    where:
+      - M(φ) = φ_γ·M_γ + φ_ε·M_ε  (phase-dependent mobility)
+      - μ is the common chemical potential from KKS constraints
+      - c is the global mixture composition (conserved)
+    
+    η evolves via Allen-Cahn with gradient energy ONLY on η:
+    
+    ∂η/∂t = -L_struct · (∂f/∂η - κ_η∇²η)
+    
+    KKS condition at interface:
+      μ^γ(c^γ) = μ^ε(c^ε) = μ  (common chemical potential)
+      c = φ_γ·c^γ + φ_ε·c^ε    (mixture rule)
+    
+    Free energy: F = ∫[ Σ φ_α·f^α(c^α) + W·g(η) + (κ_η/2)|∇η|² ] dV
+    NOTE: No gradient term on c - interface regularized by η alone.
     """
     nx, ny = c.shape
     
-    # Pre-compute Laplacians
-    lap_c = compute_laplacian_2d(c, dx)
-    lap_eta = compute_laplacian_2d(eta, dx)
-    
-    # ========== CONCENTRATION FIELD (Cahn-Hilliard) ==========
-    mu_c = np.empty_like(c)
+    # ========== STEP 1: Compute Moelans phase fractions ==========
+    phi_epsilon = np.empty_like(c)
     for i in prange(nx):
         for j in prange(ny):
-            mu_bulk = d_fchem_dc(c[i, j], T_K, Omega_Jmol, V_m)
-            mu_coup = d_fcoup_dc(c[i, j], eta[i, j], lambda_coup)
-            mu_grad = -kappa_c * lap_c[i, j]
-            mu_c[i, j] = mu_bulk + mu_coup + mu_grad
+            phi_g, phi_e = moelans_phase_fraction(eta[i, j])
+            phi_epsilon[i, j] = phi_e  # φ_ε (HCP fraction)
     
-    # Flux and divergence for c
+    # ========== STEP 2: Solve KKS for common μ, c^γ, c^ε ==========
+    mu = np.empty_like(c)
+    c_gamma_local = np.empty_like(c)
+    c_epsilon_local = np.empty_like(c)
+    
+    for i in prange(nx):
+        for j in prange(ny):
+            phi_e = phi_epsilon[i, j]
+            phi_g = 1.0 - phi_e
+            
+            # KKS closed-form solution for 2-phase parabolic free energies:
+            # μ = [c - (φ_γ·c_γ^eq + φ_ε·c_ε^eq)] / [φ_γ/K_γ + φ_ε/K_ε]
+            denom = phi_g / K_gamma + phi_e / K_epsilon
+            weighted_c_eq = phi_g * c_gamma_eq + phi_e * c_epsilon_eq
+            
+            if denom > 1e-12:
+                mu[i, j] = (c[i, j] - weighted_c_eq) / denom
+            else:
+                mu[i, j] = 0.0
+            
+            # Phase-specific compositions (KKS partitioning)
+            c_gamma_local[i, j] = c_gamma_eq + mu[i, j] / K_gamma
+            c_epsilon_local[i, j] = c_epsilon_eq + mu[i, j] / K_epsilon
+    
+    # ========== STEP 3: Diffusion equation for c using KKS form ==========
+    # Compute phase-dependent mobility: M(φ) = φ_γ·M_γ + φ_ε·M_ε
+    M_local = np.empty_like(c)
+    for i in prange(nx):
+        for j in prange(ny):
+            phi_e = phi_epsilon[i, j]
+            phi_g = 1.0 - phi_e
+            M_local[i, j] = phi_g * M_gamma + phi_e * M_epsilon
+    
+    # Flux: J_c = -M(φ) · ∇μ
     flux_c_x = np.empty_like(c)
     flux_c_y = np.empty_like(c)
     for i in prange(nx):
@@ -252,86 +280,106 @@ def update_dual_cahn_hilliard(c, eta, dt, dx,
             im1 = (i - 1) % nx
             jp1 = (j + 1) % ny
             jm1 = (j - 1) % ny
-            grad_mu_x = (mu_c[ip1, j] - mu_c[im1, j]) / (2.0 * dx)
-            grad_mu_y = (mu_c[i, jp1] - mu_c[i, jm1]) / (2.0 * dx)
-            flux_c_x[i, j] = -M_c * grad_mu_x
-            flux_c_y[i, j] = -M_c * grad_mu_y
+            
+            grad_mu_x = (mu[ip1, j] - mu[im1, j]) / (2.0 * dx)
+            grad_mu_y = (mu[i, jp1] - mu[i, jm1]) / (2.0 * dx)
+            
+            flux_c_x[i, j] = -M_local[i, j] * grad_mu_x
+            flux_c_y[i, j] = -M_local[i, j] * grad_mu_y
     
+    # Divergence of flux gives ∂c/∂t
     div_flux_c = compute_gradient_divergence_2d(flux_c_x, flux_c_y, dx)
     c_new = c + dt * div_flux_c
     
-    # ========== STRUCTURAL ORDER PARAMETER (Cahn-Hilliard) ==========
-    # FIX: η now evolves via Cahn-Hilliard (conserved), not Allen-Cahn
-    mu_eta = np.empty_like(eta)
+    # ========== STEP 4: Allen-Cahn step for η (gradient term ONLY on η) ==========
+    lap_eta = compute_laplacian_2d(eta, dx)
+    df_deta = np.empty_like(eta)
+    
     for i in prange(nx):
         for j in prange(ny):
-            mu_struct = d_fstruct_deta(eta[i, j], W_struct)
-            mu_coup_eta = d_fcoup_deta(c[i, j], eta[i, j], lambda_coup)
-            mu_grad_eta = -kappa_eta * lap_eta[i, j]
-            mu_eta[i, j] = mu_struct + mu_coup_eta + mu_grad_eta
+            # Phase fractions and derivative
+            phi_e = phi_epsilon[i, j]
+            dphi_e_deta = d_phi_epsilon_deta(eta[i, j])
+            
+            # Bulk free energies evaluated at phase compositions (KKS)
+            f_gamma = parabolic_free_energy(c_gamma_local[i, j], c_gamma_eq, K_gamma, E_gamma)
+            f_epsilon = parabolic_free_energy(c_epsilon_local[i, j], c_epsilon_eq, K_epsilon, E_epsilon)
+            
+            # Driving force from bulk energy difference (Moelans chain rule)
+            df_bulk = dphi_e_deta * (f_epsilon - f_gamma)
+            
+            # Double-well barrier term: g(η) = η²(1-η)² → ∂g/∂η = 2η(1-η)(1-2η)
+            df_barrier = 2.0 * W_barrier * eta[i, j] * (1.0 - eta[i, j]) * (1.0 - 2.0 * eta[i, j])
+            
+            # Gradient energy contribution (ONLY on η, NO term on c)
+            df_gradient = -kappa_eta * lap_eta[i, j]
+            
+            # Total variational derivative for Allen-Cahn
+            df_deta[i, j] = df_bulk + df_barrier + df_gradient
     
-    # Flux and divergence for η
-    flux_eta_x = np.empty_like(eta)
-    flux_eta_y = np.empty_like(eta)
-    for i in prange(nx):
-        for j in prange(ny):
-            ip1 = (i + 1) % nx
-            im1 = (i - 1) % nx
-            jp1 = (j + 1) % ny
-            jm1 = (j - 1) % ny
-            grad_mu_eta_x = (mu_eta[ip1, j] - mu_eta[im1, j]) / (2.0 * dx)
-            grad_mu_eta_y = (mu_eta[i, jp1] - mu_eta[i, jm1]) / (2.0 * dx)
-            flux_eta_x[i, j] = -M_eta * grad_mu_eta_x
-            flux_eta_y[i, j] = -M_eta * grad_mu_eta_y
+    # Allen-Cahn evolution (non-conserved structural order parameter)
+    eta_new = eta - dt * L_struct * df_deta
     
-    div_flux_eta = compute_gradient_divergence_2d(flux_eta_x, flux_eta_y, dx)
-    eta_new = eta + dt * div_flux_eta
-    
-    # ========== PHYSICAL BOUNDS ==========
+    # ========== STEP 5: Physical bounds clipping ==========
     for i in prange(nx):
         for j in prange(ny):
             c_new[i, j] = _clip_scalar(c_new[i, j], 0.01, 0.99)
             eta_new[i, j] = _clip_scalar(eta_new[i, j], 0.0, 1.0)
     
-    return c_new, eta_new
+    return c_new, eta_new, mu, c_gamma_local, c_epsilon_local, phi_epsilon
 
 
 # =============================================================================
-# MAIN SIMULATION CLASS: Dual Cahn-Hilliard Phase Decomposition
+# MAIN SIMULATION CLASS: KKS Phase Transformation (Diffusion + Allen-Cahn)
 # =============================================================================
 
-class MediloyDualCHPhaseDecomposition:
+class MediloyKKSPhaseTransformation:
     """
-    2D Dual Cahn-Hilliard simulation of γ-FCC ↔ ε-HCP phase decomposition
-    in Mediloy (Co-Cr-Mo) at 950°C.
+    2D phase-field simulation of γ-FCC → ε-HCP transformation
+    in Mediloy (Co-Cr-Mo) at 950°C using:
     
-    BOTH fields are conserved:
-    - c: Co mole fraction (Cahn-Hilliard)
-    - η: HCP structural order parameter (Cahn-Hilliard, NEW!)
+    - Diffusion equation for conserved Co concentration c:
+      ∂c/∂t = ∇·[M(φ) ∇μ] with M(φ) = φ_γ·M_γ + φ_ε·M_ε
+    - Allen-Cahn for non-conserved HCP order parameter η:
+      ∂η/∂t = -L·(δF/δη - κ_η∇²η)
+    - Kim-Kim-Suzuki (KKS) model for interface partitioning:
+      μ^γ = μ^ε, c = φ_γ·c^γ + φ_ε·c^ε
+    - Moelans interpolation for smooth phase fractions
+    - Gradient energy ONLY on η (interface regularized by structure alone)
     
     η = 0 → γ-FCC (austenite), η = 1 → ε-HCP (martensite)
     """
     
     def __init__(self, nx=256, ny=256, T_celsius=950.0, 
-                 Omega_Jmol=12000.0, V_m_m3mol=6.7e-6, D_b_m2s=5.0e-15):
+                 V_m_m3mol=6.7e-6, D_b_m2s=5.0e-15):
         self.nx = nx
         self.ny = ny
         self.dx_dim = 1.0
         
         # Dimensionless model parameters (tuned for numerical stability)
-        self.W_dim = 1.0           # Structural double-well barrier
-        self.kappa_c_dim = 2.0     # Concentration gradient coefficient
-        self.kappa_eta_dim = 1.0   # Structural gradient coefficient
-        self.M_c_dim = 1.0         # Chemical mobility for c (diffusion-limited)
-        self.M_eta_dim = 10.0      # Structural mobility for η (typically faster)
-        self.lambda_coup_dim = 2.0 # Coupling strength (solute drag)
-        self.dt_dim = 0.005        # Dimensionless time step
+        self.W_dim = 1.0              # Structural double-well barrier
+        self.kappa_eta_dim = 1.0      # Structural gradient coefficient (ONLY on η)
+        self.M_gamma_dim = 1.0        # Chemical mobility in FCC phase
+        self.M_epsilon_dim = 0.8      # Chemical mobility in HCP phase (slightly lower)
+        self.L_eta_dim = 100.0        # Allen-Cahn mobility for η (typically >> M)
+        self.dt_dim = 0.005           # Dimensionless time step
         
-        # Material parameters
+        # Material parameters - parabolic free energy approximation
         self.T_celsius = T_celsius
-        self.Omega_Jmol = Omega_Jmol
         self.V_m = V_m_m3mol
         self.D_b = D_b_m2s
+        
+        # Equilibrium compositions (pseudo-binary Co-M_y)
+        self.c_gamma_eq = 0.610       # Co fraction in FCC at equilibrium
+        self.c_epsilon_eq = 0.575     # Co fraction in HCP (Cr-enriched)
+        
+        # Parabola curvatures (stiffness of free energy wells)
+        self.K_gamma = 2.0e10         # J/m³ per (mole fraction)²
+        self.K_epsilon = 2.0e10
+        
+        # Energy offsets (chemical driving force)
+        self.E_gamma = 0.0
+        self.E_epsilon = -400.0 / self.V_m  # ~ -6e7 J/m³ driving force
         
         # Initialize physical scales
         self.scales = PhysicalScalesMediloy(
@@ -356,49 +404,53 @@ class MediloyDualCHPhaseDecomposition:
             'eta_mean': [], 'eta_std': [],
             'c_mean': [], 'c_std': [],
             'hcp_fraction': [], 'fcc_fraction': [],
-            'total_energy': []
+            'total_energy': [],
+            'interface_mu': []  # Track chemical potential at interface
         }
         
         self.update_history()
     
     def _update_physical_params(self):
         """Convert dimensionless parameters to physical SI units."""
-        (self.W_phys, self.kappa_c, self.kappa_eta, 
-         self.M_c, self.M_eta, self.dt_phys, self.dx_phys) = \
+        (self.W_phys, self.kappa_eta, 
+         self.M_gamma, self.M_epsilon, self.L_struct, self.dt_phys, self.dx_phys) = \
             self.scales.dim_to_phys(
-                self.W_dim, self.kappa_c_dim, self.kappa_eta_dim,
-                self.M_c_dim, self.M_eta_dim, self.dt_dim, self.dx_dim
+                self.W_dim, self.kappa_eta_dim,
+                self.M_gamma_dim, self.M_epsilon_dim,
+                self.L_eta_dim, self.dt_dim, self.dx_dim
             )
         
-        self.lambda_coup = self.lambda_coup_dim * self.scales.E0
         self.T_K = self.T_celsius + 273.15
     
-    def set_physical_parameters(self, W_Jm3=None, kappa_c_Jm=None, kappa_eta_Jm=None,
-                                M_c_m5Js=None, M_eta_m5Js=None, dt_s=None,
-                                lambda_coup_Jm3=None, Omega_Jmol=None, D_b_m2s=None):
+    def set_physical_parameters(self, W_Jm3=None, kappa_eta_Jm=None,
+                                M_gamma_m5Js=None, M_epsilon_m5Js=None, 
+                                L_eta_m3Js=None, dt_s=None,
+                                K_gamma=None, K_epsilon=None,
+                                c_gamma_eq=None, c_epsilon_eq=None,
+                                driving_force_Jmol=None):
         """Set physical parameters directly."""
-        if Omega_Jmol is not None:
-            self.Omega_Jmol = Omega_Jmol
-        if D_b_m2s is not None:
-            self.D_b = D_b_m2s
-            self.scales = PhysicalScalesMediloy(
-                T_celsius=self.T_celsius,
-                V_m_m3mol=self.V_m,
-                D_b_m2s=self.D_b
-            )
+        if driving_force_Jmol is not None:
+            self.E_epsilon = -driving_force_Jmol / self.V_m
+        
+        if K_gamma is not None:
+            self.K_gamma = K_gamma
+        if K_epsilon is not None:
+            self.K_epsilon = K_epsilon
+        if c_gamma_eq is not None:
+            self.c_gamma_eq = c_gamma_eq
+        if c_epsilon_eq is not None:
+            self.c_epsilon_eq = c_epsilon_eq
         
         if W_Jm3 is not None and self.scales.E0 > 0:
             self.W_dim = W_Jm3 / self.scales.E0
-        if kappa_c_Jm is not None and self.scales.E0 > 0 and self.scales.L0 > 0:
-            self.kappa_c_dim = kappa_c_Jm / (self.scales.E0 * self.scales.L0**2)
         if kappa_eta_Jm is not None and self.scales.E0 > 0 and self.scales.L0 > 0:
             self.kappa_eta_dim = kappa_eta_Jm / (self.scales.E0 * self.scales.L0**2)
-        if M_c_m5Js is not None and self.scales.M0 > 0:
-            self.M_c_dim = M_c_m5Js / self.scales.M0
-        if M_eta_m5Js is not None and self.scales.M0_eta > 0:
-            self.M_eta_dim = M_eta_m5Js / self.scales.M0_eta
-        if lambda_coup_Jm3 is not None and self.scales.E0 > 0:
-            self.lambda_coup_dim = lambda_coup_Jm3 / self.scales.E0
+        if M_gamma_m5Js is not None and self.scales.M0 > 0:
+            self.M_gamma_dim = M_gamma_m5Js / self.scales.M0
+        if M_epsilon_m5Js is not None and self.scales.M0 > 0:
+            self.M_epsilon_dim = M_epsilon_m5Js / self.scales.M0
+        if L_eta_m3Js is not None and self.scales.L0_struct > 0:
+            self.L_eta_dim = L_eta_m3Js / self.scales.L0_struct
         if dt_s is not None and self.scales.t0 > 0:
             self.dt_dim = dt_s / self.scales.t0
         
@@ -439,23 +491,13 @@ class MediloyDualCHPhaseDecomposition:
         self.clear_history()
         self.update_history()
     
-    def initialize_from_arrays(self, c_array, eta_array, reset_time=True):
-        """Initialize from external arrays."""
-        self.c = np.clip(np.array(c_array, dtype=np.float64), 0.01, 0.99)
-        self.eta = np.clip(np.array(eta_array, dtype=np.float64), 0.0, 1.0)
-        if reset_time:
-            self.time_phys = 0.0
-            self.step = 0
-            self.clear_history()
-            self.update_history()
-    
     def clear_history(self):
         """Clear all history tracking arrays."""
         self.history = {
             'time_phys': [], 'eta_mean': [], 'eta_std': [],
             'c_mean': [], 'c_std': [],
             'hcp_fraction': [], 'fcc_fraction': [],
-            'total_energy': []
+            'total_energy': [], 'interface_mu': []
         }
     
     def update_history(self):
@@ -468,6 +510,13 @@ class MediloyDualCHPhaseDecomposition:
         self.history['hcp_fraction'].append(float(np.sum(self.eta > 0.5) / (self.nx * self.ny)))
         self.history['fcc_fraction'].append(float(np.sum(self.eta < 0.5) / (self.nx * self.ny)))
         
+        # Track interface chemical potential (sample at η ≈ 0.5)
+        interface_mask = (self.eta > 0.4) & (self.eta < 0.6)
+        if np.any(interface_mask):
+            self.history['interface_mu'].append(float(np.mean(self._compute_mu()[interface_mask])))
+        else:
+            self.history['interface_mu'].append(np.nan)
+        
         # Compute total free energy (optional, expensive)
         if self.step % 10 == 0:
             try:
@@ -478,53 +527,74 @@ class MediloyDualCHPhaseDecomposition:
         else:
             self.history['total_energy'].append(np.nan)
     
+    def _compute_mu(self):
+        """Compute chemical potential field using KKS (helper for history)."""
+        mu = np.empty_like(self.c)
+        for i in range(self.nx):
+            for j in range(self.ny):
+                phi_g, phi_e = moelans_phase_fraction(self.eta[i, j])
+                denom = phi_g / self.K_gamma + phi_e / self.K_epsilon
+                weighted_c_eq = phi_g * self.c_gamma_eq + phi_e * self.c_epsilon_eq
+                if denom > 1e-12:
+                    mu[i, j] = (self.c[i, j] - weighted_c_eq) / denom
+                else:
+                    mu[i, j] = 0.0
+        return mu
+    
     def compute_total_free_energy(self):
         """
-        Compute total free energy: F = ∫[f_bulk + (κ_c/2)|∇c|² + (κ_η/2)|∇η|²] dV
+        Compute total free energy with KKS (gradient ONLY on η):
+        F = ∫[ Σ φ_α·f^α(c^α) + W·g(η) + (κ_η/2)|∇η|² ] dV
+        NOTE: No (κ_c/2)|∇c|² term - interface regularized by η alone.
         Returns energy in Joules.
         """
-        # Bulk free energy - vectorized via Numba type inference
-        f_chem = chemical_free_energy_density(self.c, self.T_K, self.Omega_Jmol, self.V_m)
-        f_struct = structural_free_energy(self.eta, self.W_phys)
-        f_coup = coupling_free_energy(self.c, self.eta, self.lambda_coup)
-        f_bulk = f_chem + f_struct + f_coup
+        # Phase fractions
+        phi_gamma = np.empty_like(self.c)
+        phi_epsilon = np.empty_like(self.c)
+        for i in range(self.nx):
+            for j in range(self.ny):
+                phi_gamma[i,j], phi_epsilon[i,j] = moelans_phase_fraction(self.eta[i,j])
         
-        # Gradient energy contributions
-        grad_c_x = np.zeros_like(self.c, dtype=np.float64)
-        grad_c_y = np.zeros_like(self.c, dtype=np.float64)
-        grad_eta_x = np.zeros_like(self.c, dtype=np.float64)
-        grad_eta_y = np.zeros_like(self.c, dtype=np.float64)
+        # Solve KKS for phase compositions
+        mu = self._compute_mu()
+        c_gamma_local = self.c_gamma_eq + mu / self.K_gamma
+        c_epsilon_local = self.c_epsilon_eq + mu / self.K_epsilon
         
-        nx, ny = self.nx, self.ny
-        dx = self.dx_phys
+        # Bulk free energy (KKS: evaluate at phase compositions)
+        f_gamma = parabolic_free_energy(c_gamma_local, self.c_gamma_eq, self.K_gamma, self.E_gamma)
+        f_epsilon = parabolic_free_energy(c_epsilon_local, self.c_epsilon_eq, self.K_epsilon, self.E_epsilon)
+        f_bulk = phi_gamma * f_gamma + phi_epsilon * f_epsilon
         
-        for i in range(nx):
-            for j in range(ny):
-                ip1 = (i + 1) % nx
-                im1 = (i - 1) % nx
-                jp1 = (j + 1) % ny
-                jm1 = (j - 1) % ny
-                grad_c_x[i, j] = (self.c[ip1, j] - self.c[im1, j]) / (2.0 * dx)
-                grad_c_y[i, j] = (self.c[i, jp1] - self.c[i, jm1]) / (2.0 * dx)
-                grad_eta_x[i, j] = (self.eta[ip1, j] - self.eta[im1, j]) / (2.0 * dx)
-                grad_eta_y[i, j] = (self.eta[i, jp1] - self.eta[i, jm1]) / (2.0 * dx)
+        # Barrier term
+        f_barrier = self.W_phys * self.eta**2 * (1.0 - self.eta)**2
         
-        grad_c_sq = grad_c_x**2 + grad_c_y**2
+        # Gradient energy for η ONLY (NO gradient term on c)
+        grad_eta_x = np.zeros_like(self.eta, dtype=np.float64)
+        grad_eta_y = np.zeros_like(self.eta, dtype=np.float64)
+        for i in range(self.nx):
+            for j in range(self.ny):
+                ip1 = (i + 1) % self.nx
+                im1 = (i - 1) % self.nx
+                jp1 = (j + 1) % self.ny
+                jm1 = (j - 1) % self.ny
+                grad_eta_x[i, j] = (self.eta[ip1, j] - self.eta[im1, j]) / (2.0 * self.dx_phys)
+                grad_eta_y[i, j] = (self.eta[i, jp1] - self.eta[i, jm1]) / (2.0 * self.dx_phys)
         grad_eta_sq = grad_eta_x**2 + grad_eta_y**2
-        f_gradient = 0.5 * self.kappa_c * grad_c_sq + 0.5 * self.kappa_eta * grad_eta_sq
+        f_gradient = 0.5 * self.kappa_eta * grad_eta_sq
         
-        total_F = np.sum(f_bulk + f_gradient) * (self.dx_phys**2)
+        total_F = np.sum(f_bulk + f_barrier + f_gradient) * (self.dx_phys**2)
         return float(total_F)
     
     def run_step(self):
-        """Execute one time step of dual Cahn-Hilliard dynamics."""
-        self.c, self.eta = update_dual_cahn_hilliard(
+        """Execute one time step of KKS-coupled phase transformation."""
+        self.c, self.eta, mu_field, c_g, c_e, phi_e = update_kks_phase_transformation(
             self.c, self.eta,
             self.dt_phys, self.dx_phys,
-            self.kappa_c, self.kappa_eta,
-            self.M_c, self.M_eta,
-            self.T_K, self.Omega_Jmol, self.V_m,
-            self.W_phys, self.lambda_coup
+            self.K_gamma, self.K_epsilon,
+            self.c_gamma_eq, self.c_epsilon_eq,
+            self.E_gamma, self.E_epsilon,
+            self.W_phys, self.kappa_eta, self.L_struct,
+            self.M_gamma, self.M_epsilon
         )
         self.time_phys += self.dt_phys
         self.step += 1
@@ -560,9 +630,11 @@ class MediloyDualCHPhaseDecomposition:
             'hcp_fraction': float(np.sum(self.eta > 0.5) / (self.nx * self.ny)),
             'fcc_fraction': float(np.sum(self.eta < 0.5) / (self.nx * self.ny)),
             'W_phys': self.W_phys,
-            'M_c': self.M_c,
-            'M_eta': self.M_eta,
+            'M_gamma': self.M_gamma,
+            'M_epsilon': self.M_epsilon,
+            'L_struct': self.L_struct,
             'dt_phys': self.dt_phys,
+            'driving_force_Jm3': self.E_epsilon - self.E_gamma,
         }
     
     def get_time_series(self, key):
@@ -573,14 +645,14 @@ class MediloyDualCHPhaseDecomposition:
 
 
 # =============================================================================
-# STREAMLIT APPLICATION: Interactive Dual Cahn-Hilliard Simulator
+# STREAMLIT APPLICATION: Interactive KKS Phase Transformation Simulator
 # =============================================================================
 
 def main():
     """Main Streamlit application entry point."""
     
     st.set_page_config(
-        page_title="Mediloy γ→ε Dual Cahn-Hilliard",
+        page_title="Mediloy γ→ε KKS Phase Transformation",
         page_icon="⚙️",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -596,22 +668,23 @@ def main():
     </style>
     """, unsafe_allow_html=True)
     
-    st.title("⚙️ Mediloy γ-FCC → ε-HCP Phase Decomposition (Dual Cahn-Hilliard)")
+    st.title("⚙️ Mediloy γ-FCC → ε-HCP Phase Transformation (KKS + Allen-Cahn)")
     st.markdown(f"""
-    **Conserved order parameter η evolved via full Cahn-Hilliard equation**
+    **Kim-Kim-Suzuki interface model with non-conserved structural order parameter**
     
     Pseudo-binary Co–M<sub>y</sub> phase-field simulation at {950}°C (1223 K)
     - η = 0 → γ-FCC (austenite), η = 1 → ε-HCP (martensite)
-    - BOTH c (Co fraction) AND η (HCP order) are CONSERVED fields
-    - Coupled dynamics: solute drag stabilizes HCP at interfaces
-    - Spinodal-like phase decomposition with conserved structural order
+    - **c**: CONSERVED → Diffusion equation: ∂c/∂t = ∇·[M(φ)∇μ]
+    - **η**: NON-CONSERVED → Allen-Cahn: ∂η/∂t = -L·(δF/δη - κ_η∇²η)
+    - **KKS**: μ^γ = μ^ε at interface (correct partitioning, no artificial drag)
+    - **Moelans**: φ_α = η_α²/Ση_ρ² for smooth phase fractions
+    - **Gradient energy ONLY on η** - interface regularized by structure alone
     """)
     
     if 'sim' not in st.session_state:
-        st.session_state.sim = MediloyDualCHPhaseDecomposition(
+        st.session_state.sim = MediloyKKSPhaseTransformation(
             nx=256, ny=256,
             T_celsius=950.0,
-            Omega_Jmol=12000.0,
             V_m_m3mol=6.7e-6,
             D_b_m2s=5.0e-15
         )
@@ -679,25 +752,38 @@ def main():
         
         st.divider()
         
-        st.subheader("⚙️ Model Parameters (Mediloy)")
-        st.caption("Cahn-Hilliard parameters in physical units")
+        st.subheader("⚙️ Model Parameters (KKS)")
+        st.caption("Physical parameters for phase transformation")
         
         xi_eta_nm = sim.scales.phys_to_interface_width(sim.kappa_eta, sim.W_phys) * 1e9
         
         col_p1, col_p2 = st.columns(2)
         with col_p1:
             W_phys = st.number_input("W (J/m³)", 1e4, 1e8, float(sim.W_phys), format="%.2e")
-            kappa_eta_phys = st.number_input("κ_η (J/m)", 1e-13, 1e-9, float(sim.kappa_eta), format="%.2e")
+            kappa_eta_phys = st.number_input("κ_η (J/m) [ONLY on η]", 1e-13, 1e-9, float(sim.kappa_eta), format="%.2e")
+            driving_force = st.number_input("ΔG (J/mol)", -2000, 2000, 400, 50)
         with col_p2:
-            M_eta_phys = st.number_input("M_η (m⁵/J·s)", 1e-25, 1e-17, float(sim.M_eta), format="%.2e")
+            L_eta_phys = st.number_input("L_η (m³/J·s)", 1e-15, 1e-5, float(sim.L_struct), format="%.2e")
             dt_phys = st.number_input("Δt (s)", 1e-12, 1e-5, float(sim.dt_phys), format="%.2e")
+            c_epsilon_eq = st.number_input("c_ε^eq", 0.50, 0.61, float(sim.c_epsilon_eq), 0.005)
+        
+        st.caption("Phase-dependent mobilities for diffusion equation")
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            M_gamma_phys = st.number_input("M_γ (m⁵/J·s)", 1e-25, 1e-17, float(sim.M_gamma), format="%.2e")
+        with col_m2:
+            M_epsilon_phys = st.number_input("M_ε (m⁵/J·s)", 1e-25, 1e-17, float(sim.M_epsilon), format="%.2e")
         
         if st.button("Apply Parameters", use_container_width=True):
             sim.set_physical_parameters(
                 W_Jm3=W_phys,
                 kappa_eta_Jm=kappa_eta_phys,
-                M_eta_m5Js=M_eta_phys,
-                dt_s=dt_phys
+                M_gamma_m5Js=M_gamma_phys,
+                M_epsilon_m5Js=M_epsilon_phys,
+                L_eta_m3Js=L_eta_phys,
+                dt_s=dt_phys,
+                driving_force_Jmol=driving_force,
+                c_epsilon_eq=c_epsilon_eq
             )
             st.rerun()
         
@@ -724,6 +810,9 @@ def main():
         <div class="metric-card">
         <b>🔲 Interface Width:</b> {stats['interface_width_eta_nm']:.2f} nm
         </div>
+        <div class="metric-card">
+        <b>⚡ Driving Force:</b> {stats['driving_force_Jm3']:.2e} J/m³
+        </div>
         """, unsafe_allow_html=True)
         
         st.markdown("---")
@@ -735,7 +824,7 @@ def main():
         with col_p2:
             st.metric("<span class='phase-fcc'>γ-FCC Fraction</span>", f"{stats['fcc_fraction']*100:.1f}%")
         
-        st.markdown(f"**Conserved Fields Statistics**")
+        st.markdown(f"**Field Statistics**")
         col_c1, col_c2 = st.columns(2)
         with col_c1:
             st.metric("⟨c_Co⟩", f"{stats['c_mean']:.3f}")
@@ -755,8 +844,8 @@ def main():
     col_viz1, col_viz2 = st.columns(2)
     
     with col_viz1:
-        st.subheader("ε-HCP Order Parameter η (Conserved)")
-        st.caption(f"η = 0 (FCC) → η = 1 (HCP) | t = {stats['time_formatted']} | Cahn-Hilliard dynamics")
+        st.subheader("ε-HCP Order Parameter η (Allen-Cahn)")
+        st.caption(f"η = 0 (FCC) → η = 1 (HCP) | t = {stats['time_formatted']} | Non-conserved dynamics")
         
         fig_eta = go.Figure(data=go.Heatmap(
             z=sim.eta.T,
@@ -768,7 +857,7 @@ def main():
             hovertemplate='x: %{x:.2f} μm<br>y: %{y:.2f} μm<br>η: %{z:.3f}<extra></extra>'
         ))
         fig_eta.update_layout(
-            title="Conserved HCP Phase Distribution (Cahn-Hilliard)",
+            title="HCP Phase Distribution (Allen-Cahn)",
             xaxis_title="x (μm)",
             yaxis_title="y (μm)",
             width=600, height=550,
@@ -777,8 +866,8 @@ def main():
         st.plotly_chart(fig_eta, use_container_width=True)
     
     with col_viz2:
-        st.subheader("Co Concentration c_Co (Conserved)")
-        st.caption("Nominal composition: c₀ = 0.61 (61 at.% Co) | Cahn-Hilliard dynamics")
+        st.subheader("Co Concentration c_Co (KKS Diffusion)")
+        st.caption("Nominal: c₀ = 0.61 | KKS partitioning: c^ε < c^γ at interface")
         
         fig_c = go.Figure(data=go.Heatmap(
             z=sim.c.T,
@@ -790,7 +879,7 @@ def main():
             hovertemplate='x: %{x:.2f} μm<br>y: %{y:.2f} μm<br>c: %{z:.3f}<extra></extra>'
         ))
         fig_c.update_layout(
-            title="Cobalt Mole Fraction Distribution",
+            title="Cobalt Mole Fraction (KKS Model)",
             xaxis_title="x (μm)",
             yaxis_title="y (μm)",
             width=600, height=550,
@@ -802,8 +891,8 @@ def main():
     col_overlay, col_hist = st.columns([2, 1])
     
     with col_overlay:
-        st.subheader("Phase + Composition Overlay")
-        st.caption("HCP regions (red contours) with Co depletion (blue) at interfaces")
+        st.subheader("Phase + Composition Overlay (KKS)")
+        st.caption("HCP regions (red contours) with Cr enrichment (low c) inside plates")
         
         fig_overlay = go.Figure()
         fig_overlay.add_trace(go.Heatmap(
@@ -840,17 +929,14 @@ def main():
     with col_hist:
         st.subheader("Field Distributions")
         
-        # Create subplot for both histograms
         fig_hist = make_subplots(rows=2, cols=1, subplot_titles=("η Distribution", "c_Co Distribution"))
         
-        # η histogram
         fig_hist.add_trace(
             go.Histogram(x=sim.eta.flatten(), nbinsx=40, name="η", marker_color='#e74c3c', opacity=0.7),
             row=1, col=1
         )
         fig_hist.add_vline(x=0.5, line_dash="dash", line_color="gray", row=1, col=1)
         
-        # c histogram
         fig_hist.add_trace(
             go.Histogram(x=sim.c.flatten(), nbinsx=40, name="c_Co", marker_color='#2ecc71', opacity=0.7),
             row=2, col=1
@@ -871,7 +957,7 @@ def main():
     
     # Row 3: Kinetics plots
     st.divider()
-    st.subheader("📈 Transformation Kinetics (Conserved Dynamics)")
+    st.subheader("📈 Transformation Kinetics (KKS + Allen-Cahn)")
     
     if len(sim.history['time_phys']) > 3:
         times_s = np.array(sim.history['time_phys'])
@@ -879,14 +965,14 @@ def main():
         
         fig_kin = make_subplots(
             rows=1, cols=3,
-            subplot_titles=("HCP Fraction Evolution", 
+            subplot_titles=("HCP Fraction Growth", 
                             "Field Std. Dev. (Coarsening)",
                             "Mean Composition"),
             shared_xaxes=True,
             x_title="Time (minutes)"
         )
         
-        # Plot 1: HCP fraction
+        # Plot 1: HCP fraction (should INCREASE with Allen-Cahn)
         fig_kin.add_trace(
             go.Scatter(x=times_min, y=np.array(sim.history['hcp_fraction'])*100,
                        mode='lines', name='HCP %',
@@ -901,7 +987,7 @@ def main():
         )
         fig_kin.update_yaxes(title_text="Phase fraction (%)", row=1, col=1)
         
-        # Plot 2: Standard deviations (coarsening indicator)
+        # Plot 2: Standard deviations
         fig_kin.add_trace(
             go.Scatter(x=times_min, y=sim.history['eta_std'],
                        mode='lines', name='σ(η)',
@@ -916,7 +1002,7 @@ def main():
         )
         fig_kin.update_yaxes(title_text="Standard deviation", row=1, col=2)
         
-        # Plot 3: Mean values (conservation check)
+        # Plot 3: Mean values (⟨η⟩ now CHANGES with Allen-Cahn!)
         fig_kin.add_trace(
             go.Scatter(x=times_min, y=sim.history['eta_mean'],
                        mode='lines', name='⟨η⟩',
@@ -925,7 +1011,7 @@ def main():
         )
         fig_kin.add_trace(
             go.Scatter(x=times_min, y=sim.history['c_mean'],
-                       mode='lines', name='⟨c⟩',
+                       mode='lines', name='⟨c⟩ (conserved)',
                        line=dict(color='#2ecc71', width=2)),
             row=1, col=3
         )
@@ -952,7 +1038,7 @@ def main():
                     marker=dict(size=3)
                 ))
                 fig_fe.update_layout(
-                    title="Free Energy Minimization (Dual Cahn-Hilliard)",
+                    title="Free Energy Minimization (KKS + Allen-Cahn)",
                     xaxis_title="Time (minutes)",
                     yaxis_title="Total free energy (J)",
                     height=400
@@ -982,7 +1068,7 @@ def main():
                 colorbar=dict(title="η", tickvals=[0, 0.5, 1], ticktext=['FCC', 'Interface', 'HCP'])
             ))
             fig_snap.update_layout(
-                title=f"Mediloy HCP (Conserved η) – t = {stats['time_formatted']}",
+                title=f"Mediloy HCP (Allen-Cahn η) – t = {stats['time_formatted']}",
                 xaxis_title="x (μm)",
                 yaxis_title="y (μm)",
                 width=800, height=700
@@ -991,14 +1077,14 @@ def main():
             st.download_button(
                 label="⬇️ Download PNG",
                 data=img_bytes,
-                file_name=f"Mediloy_eta_CH_t{sim.time_phys:.2e}s.png",
+                file_name=f"Mediloy_eta_AC_t{sim.time_phys:.2e}s.png",
                 mime="image/png",
                 use_container_width=True
             )
     
     with col_exp2:
         if st.button("📊 Save Kinetics Data", use_container_width=True):
-            csv_lines = ["time_s,time_min,eta_mean,eta_std,c_mean,c_std,hcp_frac,fcc_frac,energy_J"]
+            csv_lines = ["time_s,time_min,eta_mean,eta_std,c_mean,c_std,hcp_frac,fcc_frac,energy_J,interface_mu"]
             for i in range(len(sim.history['time_phys'])):
                 t_s = sim.history['time_phys'][i]
                 line = f"{t_s:.6e},"
@@ -1009,14 +1095,15 @@ def main():
                 line += f"{sim.history['c_std'][i]:.6f},"
                 line += f"{sim.history['hcp_fraction'][i]:.6f},"
                 line += f"{sim.history['fcc_fraction'][i]:.6f},"
-                line += f"{sim.history['total_energy'][i]:.6e}"
+                line += f"{sim.history['total_energy'][i]:.6e},"
+                line += f"{sim.history['interface_mu'][i]:.6e}"
                 csv_lines.append(line)
             
             csv_content = "\n".join(csv_lines)
             st.download_button(
                 label="⬇️ Download CSV",
                 data=csv_content,
-                file_name="mediloy_dualCH_kinetics.csv",
+                file_name="mediloy_kks_kinetics.csv",
                 mime="text/csv",
                 use_container_width=True
             )
@@ -1032,21 +1119,23 @@ def main():
                 step=sim.step,
                 params={
                     'T_celsius': sim.T_celsius,
-                    'Omega_Jmol': sim.Omega_Jmol,
-                    'D_b': sim.D_b,
-                    'V_m': sim.V_m,
+                    'K_gamma': sim.K_gamma,
+                    'K_epsilon': sim.K_epsilon,
+                    'c_gamma_eq': sim.c_gamma_eq,
+                    'c_epsilon_eq': sim.c_epsilon_eq,
+                    'E_gamma': sim.E_gamma,
+                    'E_epsilon': sim.E_epsilon,
                     'W_phys': sim.W_phys,
-                    'kappa_c': sim.kappa_c,
                     'kappa_eta': sim.kappa_eta,
-                    'M_c': sim.M_c,
-                    'M_eta': sim.M_eta,
+                    'M_gamma': sim.M_gamma,
+                    'M_epsilon': sim.M_epsilon,
+                    'L_struct': sim.L_struct,
                     'dt_phys': sim.dt_phys,
                     'dx_phys': sim.dx_phys,
-                    'lambda_coup': sim.lambda_coup
                 }
             )
             npz_buf.seek(0)
-            filename = f"Mediloy_dualCH_state_t{sim.time_phys:.2e}s.npz"
+            filename = f"Mediloy_KKS_state_t{sim.time_phys:.2e}s.npz"
             st.download_button(
                 label="⬇️ Download NPZ",
                 data=npz_buf.getvalue(),
@@ -1058,82 +1147,106 @@ def main():
     # =============================================================================
     # Physics Guide & Documentation
     # =============================================================================
-    with st.expander("ℹ️ Physics Guide: Dual Cahn-Hilliard for Mediloy", expanded=False):
+    with st.expander("ℹ️ Physics Guide: KKS + Allen-Cahn for Mediloy", expanded=False):
         st.markdown("""
-        ## ⚙️ Mediloy γ-FCC → ε-HCP: Dual Cahn-Hilliard Phase Decomposition
+        ## ⚙️ Mediloy γ-FCC → ε-HCP: KKS Interface Model + Allen-Cahn Dynamics
         
-        This simulation implements a **coupled dual Cahn-Hilliard model** where BOTH 
-        the Co concentration `c` AND the structural order parameter `η` are CONSERVED 
-        fields evolving via diffusion-like dynamics.
+        This simulation implements a **state-of-the-art phase-field model** for 
+        diffusional phase transformation with correct interface thermodynamics.
         
-        ### Governing Equations (Both Conserved!)
+        ### Governing Equations (REVISED per user request)
+        
+        **For the conserved composition field c** (diffusion equation with KKS):
+        ```
+        ∂c/∂t = ∇ · [ M(φ) ∇μ ]
+        ```
+        where:
+        - M(φ) = φ_γ·M_γ + φ_ε·M_ε  (phase-dependent mobility, h_i = φ_i)
+        - μ is the common chemical potential from KKS constraints
+        - This is the direct implementation of: ∂c/∂t = ∇·[(∑h_i M_i) ∇(∂f_bulk/∂c_i)]
+          with the KKS reduction that ∂f_bulk/∂c_i → μ (common tangent)
+        
+        **For the non-conserved structural order parameter η** (Allen-Cahn):
+        ```
+        ∂η/∂t = -L_struct · (∂f/∂η - κ_η∇²η)
+        ```
+        
+        ### Kim-Kim-Suzuki (KKS) Interface Model
+        
+        At every point in the diffuse interface, the model enforces:
+        
+        1. **Equal chemical potentials**: μ^γ(c^γ) = μ^ε(c^ε) = μ
+        2. **Mixture rule**: c = φ_γ·c^γ + φ_ε·c^ε
+        
+        This ensures:
+        - ✅ Correct Cr/Mo partitioning: HCP is Cr-rich (lower c_Co)
+        - ✅ No artificial solute drag at interfaces
+        - ✅ Accurate interface kinetics even with wide interfaces
+        
+        ### Free Energy Functional (KKS + Moelans, GRADIENT ONLY ON η)
         
         ```
-        ∂c/∂t = ∇·[ M_c ∇(δF/δc) ]      (Cahn-Hilliard for Co concentration)
-        ∂η/∂t = ∇·[ M_η ∇(δF/δη) ]      (Cahn-Hilliard for HCP order parameter) ← NEW!
+        F = ∫[ φ_γ·f^γ(c^γ) + φ_ε·f^ε(c^ε) + W·η²(1-η)² + (κ_η/2)|∇η|² ] dV
         ```
         
-        ### Free Energy Functional
-        
-        ```
-        F = ∫[ f_chem(c) + f_struct(η) + f_coup(c,η) 
-               + (κ_c/2)|∇c|² + (κ_η/2)|∇η|² ] dV
-        ```
+        **IMPORTANT**: There is NO (κ_c/2)|∇c|² term. The interface is regularized
+        solely through the structural order parameter η. This avoids double-counting
+        of gradient energy and is consistent with the physical picture that the
+        structural transition (FCC→HCP) defines the interface width.
         
         | Term | Expression | Meaning |
         |------|-----------|---------|
-        | f_chem | (RT/V_m)[c·ln(c)+(1-c)·ln(1-c)] + (Ω/V_m)·c(1-c) | Regular solution mixing |
-        | f_struct | W·η²(1-η)² | Double-well: FCC (η=0) ↔ HCP (η=1) |
-        | f_coup | -λ·(1-c)·η² | Solute drag: Cr stabilizes HCP |
+        | f^α(c^α) | ½K_α(c^α - c_α^eq)² + E_α | Parabolic bulk energy per phase |
+        | φ_α | η_α² / Ση_ρ² | Moelans phase fraction (smooth, vanishing derivatives) |
+        | W·η²(1-η)² | Double-well barrier | Controls interface energy |
+        | (κ_η/2)|∇η|² | Gradient energy | Regularizes η interface (NO term on c) |
         
-        ### Key Differences from Allen-Cahn η Evolution
+        ### Key Differences from Cahn-Hilliard Formulation
         
-        | Feature | Allen-Cahn (non-conserved) | Cahn-Hilliard (conserved) |
-        |---------|---------------------------|---------------------------|
-        | Evolution | ∂η/∂t = -L·(δF/δη) | ∂η/∂t = ∇·[M_η ∇(δF/δη)] |
-        | Conservation | ❌ η can change globally | ✅ ∫η dV = constant |
-        | Kinetics | Interface motion dominated | Bulk diffusion + interface motion |
-        | Morphology | Sharp interface propagation | Spinodal decomposition, coarsening |
-        | Physical meaning | Order parameter relaxation | Conserved phase fraction evolution |
+        | Feature | Cahn-Hilliard for c | KKS Diffusion Equation (This Model) |
+        |---------|---------------------|-------------------------------------|
+        | Evolution eqn | ∂c/∂t = ∇·[M∇(δF/δc)] | ∂c/∂t = ∇·[M(φ)∇μ] |
+        | Gradient on c | Yes: (κ_c/2)\|∇c\|² in F | No: interface via η only |
+        | Chemical potential | δF/δc (functional derivative) | μ (common tangent from KKS) |
+        | Mobility | Constant or c-dependent | Phase-dependent: M(φ) = φ_γM_γ + φ_εM_ε |
+        | Physical interpretation | Spinodal decomposition | Classic diffusional transformation |
         
-        ### When to Use Conserved η (Cahn-Hilliard)?
+        ### When to Use This Model?
         
-        ✓ Modeling **phase decomposition** where HCP fraction is globally conserved  
-        ✓ Studying **spinodal decomposition** of structural order  
-        ✓ Simulating **coarsening/Ostwald ripening** of HCP domains  
-        ✓ When η represents a **conserved structural variant fraction**  
+        ✓ Modeling **γ→ε martensitic/diffusional transformation** in Mediloy  
+        ✓ Studying **interface-controlled growth** of HCP plates  
+        ✓ When **solute partitioning** at interface matters (Cr enrichment in HCP)  
+        ✓ When the **total HCP fraction should change** with time (nucleation + growth)  
+        ✓ When you want **gradient energy only on the structural order parameter**  
         
-        ### When Allen-Cahn Might Be More Appropriate?
-        
-        ✓ Martensitic transformation via **dislocation glide** (interface motion)  
-        ✓ When η represents a **non-conserved order parameter** (e.g., crystal orientation)  
-        ✓ Fast structural relaxation compared to solute diffusion  
-        
-        ### Numerical Stability for Dual Cahn-Hilliard
+        ### Numerical Stability Tips
         
         ```
-        Δt ≲ min[ 0.01·(Δx)⁴/(M_c·κ_c),  0.01·(Δx)⁴/(M_η·κ_η) ]
+        Δt ≲ min[ 0.01·(Δx)²/(M·K),  0.01·(Δx)²/(L_struct·W) ]
         ```
         
         Recommendations:
-        1. Ensure ξ/Δx ≥ 3 for both fields
-        2. Start with small Δt; M_η often needs smaller time steps than M_c
-        3. Monitor both c ∈ [0.01, 0.99] and η ∈ [0, 1]
+        1. Ensure ξ/Δx ≥ 3 for proper interface resolution (ξ = √(κ_η/W))
+        2. L_struct is typically 10-100× larger than M (structural relaxation is faster)
+        3. Monitor c ∈ [0.01, 0.99] and η ∈ [0, 1] for physical bounds
+        4. Check that ⟨c⟩ remains constant (conservation) while ⟨η⟩ evolves
+        5. Use M_ε ≈ 0.8·M_γ to reflect slightly slower diffusion in HCP
         
         ### Interpreting Results
         
-        - **Conserved ⟨η⟩**: The mean HCP fraction should remain ~constant (check kinetics plot)
-        - **Coarsening**: σ(η) typically increases then decreases as domains merge
-        - **Coupled segregation**: Cr enrichment (low c) at HCP interfaces visible in overlay
-        - **Energy decay**: Total free energy should monotonically decrease
+        - **⟨η⟩ increases**: HCP phase grows from seeds (Allen-Cahn driving force)
+        - **⟨c⟩ constant**: Global Co conservation (diffusion equation)
+        - **c^ε < c^γ inside interface**: Cr enrichment in HCP (KKS partitioning)
+        - **Energy decay**: Total F decreases monotonically (thermodynamic consistency)
+        - **Interface width**: Set by κ_η and W only (no contribution from c gradients)
         
         ### References
         
-        1. Cahn, J.W. & Hilliard, J.E. (1958). *J. Chem. Phys.* **28**, 258.
-        2. Allen, S.M. & Cahn, J.W. (1979). *Acta Metall.* **27**, 1085.
-        3. Brachavort, S. et al. (2015). *Acta Mater.* **99**, 262. [Co-Cr phase diagrams]
+        1. Kim, S.G., Kim, W.T., Suzuki, T. (1999). *Phys. Rev. E* **60**, 7186. [KKS model]
+        2. Moelans, N., Blanpain, B., Wollants, P. (2008). *Phys. Rev. B* **78**, 024113. [Interpolation]
+        3. Steinbach, I. (2013). *Model. Simul. Mater. Sci. Eng.* **21**, 015005. [Review]
         4. Yamanaka, K. et al. (2018). *Dent. Mater. J.* **37**, 1. [Mediloy microstructure]
-        5. Steinbach, I. (2009). *Model. Simul. Mater. Sci. Eng.* **17**, 073001. [Phase-field review]
+        5. Provatas, N., Elder, K. (2010). *Phase-Field Methods in Materials Science*. [Textbook]
         """)
     
     # =============================================================================
@@ -1165,9 +1278,10 @@ def main():
     # Footer
     st.markdown("---")
     st.caption(
-        "Mediloy γ→ε Dual Cahn-Hilliard Simulator | Both c AND η are CONSERVED | "
-        f"Physical Units: m, s, J/m³ | T = {sim.T_celsius}°C | "
-        f"Pseudo-binary Co-M<sub>y</sub> (c₀ = 0.61) | Visualized with Plotly"
+        "Mediloy γ→ε KKS Phase Transformation | c: Diffusion eqn ∇·[M(φ)∇μ] (conserved) | "
+        "η: Allen-Cahn (non-conserved) | KKS interface: μ^γ=μ^ε | "
+        "Gradient energy ONLY on η | "
+        f"T = {sim.T_celsius}°C | Pseudo-binary Co-M<sub>y</sub> (c₀ = 0.61)"
     )
 
 
@@ -1176,13 +1290,14 @@ def main():
 # =============================================================================
 
 if __name__ == "__main__":
-    print("⚙️ Starting Mediloy Dual Cahn-Hilliard Phase Decomposition Simulator...")
+    print("⚙️ Starting Mediloy KKS Phase Transformation Simulator...")
     print(f"   Python: {sys.version.split()[0]}")
     print(f"   NumPy: {np.__version__}")
-    print(f"   Numba: JIT compilation enabled (type inference mode)")
+    print(f"   Numba: JIT compilation enabled")
     print(f"   Streamlit: launching interactive app")
     print(f"   Temperature: 950°C (1223.15 K)")
-    print(f"   Model: Dual Cahn-Hilliard (c AND η conserved)")
+    print(f"   Model: Diffusion eqn for c + Allen-Cahn for η + KKS interface")
+    print(f"   Gradient energy: ONLY on η (NO term on c)")
     print(f"   Initial condition: FCC matrix + random HCP seeds")
     
     main()
