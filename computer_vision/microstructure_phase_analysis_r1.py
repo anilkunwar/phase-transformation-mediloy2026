@@ -10,10 +10,12 @@ import re
 from pathlib import Path
 import traceback
 import sys
+import json
+from datetime import datetime
 
 # Enable PIL to load truncated or partially corrupted images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-ImageFile.MAX_IMAGE_PIXELS = None  # Remove pixel limit for large images
+ImageFile.MAX_IMAGE_PIXELS = None
 
 # Page Configuration
 st.set_page_config(page_title="Microstructure Phase Analyzer", layout="wide", page_icon="🔬")
@@ -32,12 +34,7 @@ It calculates **phase fractions**, **area fractions**, and morphological metrics
 # --- Helper Functions ---
 
 def parse_filename(filename):
-    """
-    Parse filename according to convention: ABN.ext
-    A: C (Continuous wave) or P (Pulse laser)
-    B: NH (Not heated, t=0) or H (Heated, t=35 min)
-    N: 0 (0 degree) or 45 (45 degree orientation)
-    """
+    """Parse filename according to convention: ABN.ext"""
     name_without_ext = Path(filename).stem
     pattern = r'^([CP])(NH|H)(\d+)$'
     match = re.match(pattern, name_without_ext, re.IGNORECASE)
@@ -75,11 +72,9 @@ def parse_filename(filename):
         }
 
 def get_script_directory():
-    """Get the directory where the script is located - works on local and Streamlit Cloud"""
+    """Get the directory where the script is located"""
     try:
-        # Try multiple methods to find script location
         if getattr(sys, 'frozen', False):
-            # Running as bundled executable
             script_dir = os.path.dirname(sys.executable)
         elif '__file__' in globals():
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -91,7 +86,7 @@ def get_script_directory():
         return os.getcwd()
 
 def scan_images_folder(folder_path="./images"):
-    """Scan the images folder and return list of valid image files with detailed logging"""
+    """Scan the images folder and return list of valid image files"""
     supported_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
     images = []
     abs_folder_path = os.path.abspath(folder_path)
@@ -141,23 +136,19 @@ def scan_images_folder(folder_path="./images"):
     return sorted(images)
 
 def load_image_robust(image_path):
-    """
-    Ultra-robust image loading with multiple aggressive fallbacks for Streamlit Cloud
-    Handles BMP format variations, corrupted files, and headless environment issues
-    """
+    """Ultra-robust image loading with multiple fallbacks"""
     st.info(f"🔄 Loading: {os.path.basename(image_path)}")
     st.write(f"📍 Path: `{image_path}`")
     
-    # Method 1: PIL with maximum tolerance and conversion
+    # Method 1: PIL with maximum tolerance
     try:
         st.write("  → Method 1: PIL direct load...")
         img = Image.open(image_path)
-        img.load()  # Force load to catch errors early
+        img.load()
         if img.mode in ('RGBA', 'LA', 'P', 'PA', '1', 'L'):
             if img.mode == 'P':
                 img = img.convert('RGBA')
             if img.mode in ('RGBA', 'LA', 'PA'):
-                # Create white background for transparency
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 if img.mode == 'PA':
                     img = img.convert('RGBA')
@@ -172,18 +163,17 @@ def load_image_robust(image_path):
     except Exception as e1:
         st.warning(f"  ✗ PIL failed: {type(e1).__name__}: {e1}")
     
-    # Method 2: OpenCV with aggressive flags for BMP compatibility
+    # Method 2: OpenCV with aggressive flags
     try:
         st.write("  → Method 2: OpenCV with IMREAD flags...")
-        # Try multiple OpenCV flags for maximum compatibility
         for flag in [cv2.IMREAD_COLOR, cv2.IMREAD_UNCHANGED, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH]:
             img_cv = cv2.imread(image_path, flag)
             if img_cv is not None and img_cv.size > 0:
-                if len(img_cv.shape) == 2:  # Grayscale
+                if len(img_cv.shape) == 2:
                     img_cv = cv2.cvtColor(img_cv, cv2.COLOR_GRAY2RGB)
-                elif img_cv.shape[2] == 4:  # BGRA
+                elif img_cv.shape[2] == 4:
                     img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGRA2RGB)
-                elif img_cv.shape[2] == 3:  # BGR
+                elif img_cv.shape[2] == 3:
                     img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(img_cv)
                 st.success(f"  ✓ OpenCV load successful (flag: {flag})")
@@ -192,7 +182,7 @@ def load_image_robust(image_path):
     except Exception as e2:
         st.warning(f"  ✗ OpenCV failed: {type(e2).__name__}: {e2}")
     
-    # Method 3: Read raw bytes + PIL from memory buffer
+    # Method 3: Raw bytes + PIL from memory
     try:
         st.write("  → Method 3: Raw bytes + PIL memory load...")
         with open(image_path, 'rb') as f:
@@ -221,12 +211,11 @@ def load_image_robust(image_path):
     except Exception as e3:
         st.warning(f"  ✗ Bytes load failed: {type(e3).__name__}: {e3}")
     
-    # Method 4: Force BMP conversion via OpenCV → PNG in memory (lossless)
+    # Method 4: BMP → PNG conversion in memory
     file_ext = Path(image_path).suffix.lower()
     if file_ext == '.bmp':
         try:
             st.write("  → Method 4: BMP → PNG conversion in memory...")
-            # Try reading with different OpenCV approaches
             img_cv = None
             for flag in [cv2.IMREAD_COLOR, cv2.IMREAD_UNCHANGED]:
                 img_cv = cv2.imread(image_path, flag)
@@ -234,7 +223,6 @@ def load_image_robust(image_path):
                     break
             
             if img_cv is not None and img_cv.size > 0:
-                # Convert BGR to RGB
                 if len(img_cv.shape) == 2:
                     img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_GRAY2RGB)
                 elif img_cv.shape[2] == 4:
@@ -242,13 +230,11 @@ def load_image_robust(image_path):
                 else:
                     img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
                 
-                # Convert to PIL and save as PNG in memory (lossless, better than JPEG for microscopy)
                 pil_img = Image.fromarray(img_rgb)
                 png_buffer = io.BytesIO()
                 pil_img.save(png_buffer, format='PNG', compress_level=6)
                 png_buffer.seek(0)
                 
-                # Reload from PNG buffer
                 final_img = Image.open(png_buffer)
                 if final_img.mode != 'RGB':
                     final_img = final_img.convert('RGB')
@@ -259,7 +245,7 @@ def load_image_robust(image_path):
         except Exception as e4:
             st.warning(f"  ✗ BMP conversion failed: {type(e4).__name__}: {e4}")
     
-    # Method 5: Try imageio as final fallback (if available)
+    # Method 5: imageio fallback
     try:
         import imageio
         st.write("  → Method 5: imageio fallback...")
@@ -277,11 +263,11 @@ def load_image_robust(image_path):
             st.success("  ✓ imageio fallback successful")
             return img
     except ImportError:
-        st.write("  → imageio not available (install with: pip install imageio)")
+        st.write("  → imageio not available")
     except Exception as e5:
         st.warning(f"  ✗ imageio failed: {type(e5).__name__}: {e5}")
     
-    # All methods failed - provide detailed error report
+    # All methods failed
     st.error(f"❌ CRITICAL: All loading methods failed for: {os.path.basename(image_path)}")
     st.error(f"📍 Full path: {image_path}")
     st.error(f"📏 File size: {os.path.getsize(image_path) if os.path.exists(image_path) else 'N/A'} bytes")
@@ -289,60 +275,177 @@ def load_image_robust(image_path):
     with st.expander("🔍 Full Error Traceback"):
         st.code(traceback.format_exc())
     
-    with st.expander("💡 Troubleshooting Suggestions"):
+    with st.expander("💡 Troubleshooting"):
         st.write("""
-        1. **Convert BMP to PNG locally** (recommended):
+        1. **Convert BMP to PNG locally**:
            ```python
            from PIL import Image
            img = Image.open('CH0.bmp')
            img.save('CH0.png')
            ```
-        
-        2. **Check file integrity**: Try opening the BMP in an image viewer
-        
-        3. **Re-encode the file**: Use GIMP, ImageMagick, or Python to re-save
-        
-        4. **Use upload option**: Try uploading the file manually via sidebar
-        
-        5. **Check file permissions**: Ensure the file is readable in the cloud environment
+        2. **Check file integrity** in an image viewer
+        3. **Use upload option** as workaround
         """)
     
     return None
 
-def convert_image_format(img, output_format='PNG', quality=95):
-    """Convert PIL image to specified format in memory with transparency handling"""
-    try:
-        buffer = io.BytesIO()
-        if output_format.upper() in ('JPEG', 'JPG'):
-            # JPEG doesn't support transparency - add white background
-            if img.mode in ('RGBA', 'LA', 'PA'):
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                if img.mode == 'PA':
-                    img = img.convert('RGBA')
-                if img.mode == 'RGBA':
-                    background.paste(img, mask=img.split()[3])
-                    img = background
-                else:
-                    img = img.convert('RGB')
-            elif img.mode != 'RGB':
-                img = img.convert('RGB')
-            img.save(buffer, format='JPEG', quality=quality, optimize=True)
-        else:
-            # PNG, TIFF support transparency
-            if output_format.upper() == 'PNG':
-                img.save(buffer, format='PNG', compress_level=6)
-            else:
-                img.save(buffer, format=output_format)
-        buffer.seek(0)
-        return buffer
-    except Exception as e:
-        st.error(f"Error converting image format: {e}")
+def create_overlay_safe(img_np, mask_red, mask_green):
+    """Create segmentation overlay with proper dtype handling - FIXES THE VALUE ERROR"""
+    # Convert to float32 for safe arithmetic operations
+    overlay = img_np.astype(np.float32).copy()
+    
+    # Create 3D masks for broadcasting
+    red_mask_3d = np.stack([mask_red] * 3, axis=-1).astype(bool)
+    green_mask_3d = np.stack([mask_green] * 3, axis=-1).astype(bool)
+    
+    # Apply red tint for HCP phase (with proper float arithmetic)
+    if np.any(red_mask_3d):
+        red_tint = np.array([255, 80, 80], dtype=np.float32)
+        overlay[red_mask_3d] = overlay[red_mask_3d] * 0.6 + red_tint * 0.4
+    
+    # Apply green tint for FCC phase
+    if np.any(green_mask_3d):
+        green_tint = np.array([80, 255, 80], dtype=np.float32)
+        overlay[green_mask_3d] = overlay[green_mask_3d] * 0.6 + green_tint * 0.4
+    
+    # Clip to valid range and convert back to uint8
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    
+    return overlay
+
+def generate_radar_chart_data(df_all, area_per_pixel):
+    """Generate data for radar chart comparing phase metrics"""
+    if df_all.empty:
         return None
+    
+    radar_data = []
+    
+    for phase in df_all['Phase'].unique():
+        phase_df = df_all[df_all['Phase'] == phase]
+        
+        metrics = {
+            'Phase': phase.replace(' (Red)', '').replace(' (Green)', ''),
+            'Grain Count': len(phase_df),
+            'Avg Area (µm²)': phase_df['Area (µm²)'].mean(),
+            'Avg ECD (µm)': phase_df['ECD (µm)'].mean(),
+            'Avg Circularity': phase_df['Circularity'].mean(),
+            'Avg Aspect Ratio': phase_df['Aspect Ratio'].mean(),
+            'Total Area (µm²)': phase_df['Area (µm²)'].sum()
+        }
+        radar_data.append(metrics)
+    
+    return pd.DataFrame(radar_data)
+
+def generate_chord_data(df_all, red_fraction, green_fraction, boundary_fraction):
+    """Generate data for chord diagram showing phase relationships"""
+    # Nodes: phases and their interactions
+    nodes = [
+        {"name": "HCP ε", "color": "#e74c3c"},
+        {"name": "FCC γ", "color": "#2ecc71"},
+        {"name": "Boundaries", "color": "#95a5a6"}
+    ]
+    
+    # Links: represent area fractions and morphological relationships
+    links = []
+    
+    # Add fraction-based links (normalized to 100)
+    total = red_fraction + green_fraction + boundary_fraction
+    if total > 0:
+        # Self-loops representing phase abundance
+        links.append({"source": 0, "target": 0, "value": red_fraction / total * 100, "label": f"HCP ε: {red_fraction:.1f}%"})
+        links.append({"source": 1, "target": 1, "value": green_fraction / total * 100, "label": f"FCC γ: {green_fraction:.1f}%"})
+        links.append({"source": 2, "target": 2, "value": boundary_fraction / total * 100, "label": f"Boundaries: {boundary_fraction:.1f}%"})
+        
+        # Cross-phase interaction links (representing interface area)
+        interface_strength = min(red_fraction, green_fraction) * 0.5  # Simplified metric
+        if interface_strength > 0:
+            links.append({"source": 0, "target": 1, "value": interface_strength, "label": "HCP-FCC Interface"})
+            links.append({"source": 1, "target": 0, "value": interface_strength, "label": "FCC-HCP Interface"})
+    
+    # Add morphological correlation links if data available
+    if not df_all.empty:
+        hcp_df = df_all[df_all['Phase'].str.contains('HCP', case=False, na=False)]
+        fcc_df = df_all[df_all['Phase'].str.contains('FCC', case=False, na=False)]
+        
+        if not hcp_df.empty and not fcc_df.empty:
+            # Correlation based on circularity similarity
+            hcp_circ = hcp_df['Circularity'].mean()
+            fcc_circ = fcc_df['Circularity'].mean()
+            circ_similarity = 1 - abs(hcp_circ - fcc_circ)
+            
+            if circ_similarity > 0.3:
+                links.append({
+                    "source": 0, 
+                    "target": 1, 
+                    "value": circ_similarity * 30, 
+                    "label": f"Shape Similarity: {circ_similarity:.2f}"
+                })
+    
+    return {"nodes": nodes, "links": links}
+
+def create_comprehensive_csv(df_all, red_fraction, green_fraction, boundary_fraction, 
+                            red_area_abs, green_area_abs, boundary_area_abs,
+                            image_info, filename, domain_size_um, area_per_pixel):
+    """Create comprehensive CSV with all analysis results"""
+    results = []
+    
+    # Metadata section
+    results.append({"Category": "METADATA", "Parameter": "Filename", "Value": filename, "Unit": ""})
+    results.append({"Category": "METADATA", "Parameter": "Analysis Timestamp", "Value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Unit": ""})
+    results.append({"Category": "METADATA", "Parameter": "Domain Size", "Value": domain_size_um, "Unit": "µm"})
+    results.append({"Category": "METADATA", "Parameter": "Area per Pixel", "Value": area_per_pixel, "Unit": "µm²/px"})
+    
+    # Experimental conditions if parsed
+    if image_info and image_info.get('valid'):
+        results.append({"Category": "EXPERIMENT", "Parameter": "Laser Type", "Value": image_info['laser_description'], "Unit": ""})
+        results.append({"Category": "EXPERIMENT", "Parameter": "Heating Condition", "Value": image_info['heating_description'], "Unit": ""})
+        results.append({"Category": "EXPERIMENT", "Parameter": "Isothermal Time", "Value": image_info['time'], "Unit": ""})
+        results.append({"Category": "EXPERIMENT", "Parameter": "Orientation", "Value": f"{image_info['orientation']}°", "Unit": "degrees"})
+    
+    # Phase fractions
+    results.append({"Category": "PHASE_FRACTIONS", "Parameter": "HCP ε Fraction", "Value": red_fraction, "Unit": "%"})
+    results.append({"Category": "PHASE_FRACTIONS", "Parameter": "FCC γ Fraction", "Value": green_fraction, "Unit": "%"})
+    results.append({"Category": "PHASE_FRACTIONS", "Parameter": "Boundary Fraction", "Value": boundary_fraction, "Unit": "%"})
+    
+    # Absolute areas
+    results.append({"Category": "ABSOLUTE_AREAS", "Parameter": "HCP ε Area", "Value": red_area_abs, "Unit": "µm²"})
+    results.append({"Category": "ABSOLUTE_AREAS", "Parameter": "FCC γ Area", "Value": green_area_abs, "Unit": "µm²"})
+    results.append({"Category": "ABSOLUTE_AREAS", "Parameter": "Boundary Area", "Value": boundary_area_abs, "Unit": "µm²"})
+    
+    # Summary statistics per phase
+    if not df_all.empty:
+        for phase in df_all['Phase'].unique():
+            phase_df = df_all[df_all['Phase'] == phase]
+            phase_name = phase.replace(' (Red)', '').replace(' (Green)', '')
+            
+            results.append({"Category": f"SUMMARY_{phase_name}", "Parameter": "Grain Count", "Value": len(phase_df), "Unit": "count"})
+            results.append({"Category": f"SUMMARY_{phase_name}", "Parameter": "Mean Area", "Value": phase_df['Area (µm²)'].mean(), "Unit": "µm²"})
+            results.append({"Category": f"SUMMARY_{phase_name}", "Parameter": "Std Area", "Value": phase_df['Area (µm²)'].std(), "Unit": "µm²"})
+            results.append({"Category": f"SUMMARY_{phase_name}", "Parameter": "Mean ECD", "Value": phase_df['ECD (µm)'].mean(), "Unit": "µm"})
+            results.append({"Category": f"SUMMARY_{phase_name}", "Parameter": "Mean Circularity", "Value": phase_df['Circularity'].mean(), "Unit": ""})
+            results.append({"Category": f"SUMMARY_{phase_name}", "Parameter": "Mean Aspect Ratio", "Value": phase_df['Aspect Ratio'].mean(), "Unit": ""})
+    
+    # Individual grain data
+    for _, row in df_all.iterrows():
+        results.append({
+            "Category": "GRAIN_DATA",
+            "Parameter": f"Grain_{row['Grain ID']}",
+            "Value": json.dumps({
+                "phase": row['Phase'],
+                "area_um2": row['Area (µm²)'],
+                "ecd_um": row['ECD (µm)'],
+                "circularity": row['Circularity'],
+                "aspect_ratio": row['Aspect Ratio']
+            }),
+            "Unit": "JSON"
+        })
+    
+    return pd.DataFrame(results)
 
 # --- Sidebar Controls ---
 st.sidebar.header("📁 Image Source")
 
-# Directory information for debugging
+# Directory information
 st.sidebar.subheader("📍 Environment Info")
 script_dir = get_script_directory()
 cwd = os.getcwd()
@@ -366,13 +469,12 @@ selected_filename = None
 if source_option == "📂 From ./images/ Folder":
     st.sidebar.subheader("🔍 Searching for Images")
     
-    # Multiple path strategies for maximum compatibility
     possible_paths = [
         "./images",
         "images", 
         os.path.join(script_dir, "images"),
         os.path.join(cwd, "images"),
-        "/mount/src/phase-transformation-mediloy2026/computer_vision/images",  # Streamlit Cloud specific
+        "/mount/src/phase-transformation-mediloy2026/computer_vision/images",
     ]
     
     available_images = []
@@ -389,7 +491,6 @@ if source_option == "📂 From ./images/ Folder":
         else:
             st.sidebar.text(f"❌ Not found: `{path}`")
     
-    # Troubleshooting if no images found
     if not available_images:
         st.sidebar.markdown("---")
         st.sidebar.subheader("🔧 Troubleshooting")
@@ -402,7 +503,6 @@ if source_option == "📂 From ./images/ Folder":
             status = "✅" if (exists and is_dir) else "❌"
             st.sidebar.text(f"  {status} {abs_path}")
         
-        # Show script directory contents
         st.sidebar.write("**📋 Script directory contents:**")
         try:
             script_contents = os.listdir(script_dir)
@@ -416,7 +516,6 @@ if source_option == "📂 From ./images/ Folder":
         except Exception as e:
             st.sidebar.error(f"Cannot list: {e}")
         
-        # Create folder button
         st.sidebar.write("**➕ Create images folder?**")
         if st.sidebar.button("📁 Create ./images folder now"):
             try:
@@ -428,7 +527,6 @@ if source_option == "📂 From ./images/ Folder":
             except Exception as e:
                 st.sidebar.error(f"❌ Failed: {e}")
     
-    # Image selection if available
     if available_images:
         st.sidebar.markdown("---")
         st.sidebar.success(f"✅ Found {len(available_images)} image(s)")
@@ -442,7 +540,6 @@ if source_option == "📂 From ./images/ Folder":
         if selected_filename:
             image_info = parse_filename(selected_filename)
             
-            # Construct full path
             if images_folder_path:
                 image_path = os.path.join(images_folder_path, selected_filename)
             elif images_path_used:
@@ -452,7 +549,6 @@ if source_option == "📂 From ./images/ Folder":
             
             st.sidebar.write(f"**🔗 Loading:** `{selected_filename}`")
             
-            # Load with robust function
             selected_folder_image = load_image_robust(image_path)
             
             if selected_folder_image is not None:
@@ -467,7 +563,6 @@ if source_option == "📂 From ./images/ Folder":
                 st.sidebar.error(f"❌ Failed to load: {selected_filename}")
                 st.sidebar.info("💡 Try: Upload manually or convert BMP→PNG locally")
 else:
-    # File upload option
     uploaded_file = st.sidebar.file_uploader(
         "📤 Upload Microstructure Image", 
         type=["png", "jpg", "jpeg", "bmp", "tiff", "tif"],
@@ -478,7 +573,6 @@ else:
         image_info = parse_filename(uploaded_file.name)
         
         try:
-            # Try direct PIL load first
             selected_folder_image = Image.open(uploaded_file)
             if selected_folder_image.mode in ('RGBA', 'LA', 'P', 'PA'):
                 if selected_folder_image.mode == 'P':
@@ -496,7 +590,6 @@ else:
             st.sidebar.success(f"✅ Uploaded: {uploaded_file.name}")
         except Exception as e:
             st.sidebar.error(f"❌ Upload failed: {e}")
-            # Fallback: read bytes and try OpenCV
             try:
                 uploaded_file.seek(0)
                 file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
@@ -548,7 +641,6 @@ elif image_info and not image_info.get('valid'):
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Analysis Configuration")
 
-# Physical Calibration
 st.sidebar.subheader("📏 Physical Calibration")
 domain_size_um = st.sidebar.number_input(
     "Total Domain Length (µm)", 
@@ -560,7 +652,6 @@ domain_size_um = st.sidebar.number_input(
 )
 st.sidebar.info(f"📐 Domain: {domain_size_um} × {domain_size_um} µm = {domain_size_um**2:,.0f} µm²")
 
-# Analysis Options
 st.sidebar.subheader("🔬 Analysis Options")
 exclude_boundaries = st.sidebar.checkbox(
     "🚫 Exclude grain boundaries from area fraction", 
@@ -568,14 +659,9 @@ exclude_boundaries = st.sidebar.checkbox(
     help="When checked: HCP ε + FCC γ = 100% (boundaries excluded from normalization)"
 )
 
-# Segmentation Settings
 st.sidebar.subheader("🎨 Segmentation Settings")
 use_auto_threshold = st.sidebar.checkbox("🤖 Use automatic HSV color detection", value=True)
 
-if not use_auto_threshold:
-    st.sidebar.warning("⚠️ Manual HSV mode not fully implemented - using robust defaults")
-
-# Advanced: Morphology settings
 st.sidebar.subheader("🔧 Mask Refinement")
 apply_morphology = st.sidebar.checkbox("✨ Apply morphological cleaning", value=True, help="Remove noise and smooth grain boundaries")
 
@@ -685,7 +771,7 @@ if uploaded_file is not None and selected_folder_image is not None:
         
         data = []
         for prop in props:
-            if prop.area < 5:  # Filter noise
+            if prop.area < 5:
                 continue
             
             area_um2 = prop.area * area_per_pixel
@@ -765,118 +851,259 @@ if uploaded_file is not None and selected_folder_image is not None:
         with c2:
             st.image(mask_green, caption="🟢 FCC γ Mask", use_column_width=True)
         
-        # Overlay visualization
+        # Overlay visualization - FIXED VERSION
         with st.expander("🔍 View Segmentation Overlay"):
-            overlay = img_np.copy().astype(float)
-            # Highlight HCP in red
-            red_mask_3d = np.stack([mask_red]*3, axis=-1)
-            overlay[red_mask_3d > 0] = overlay[red_mask_3d > 0] * 0.6 + np.array([255, 80, 80]) * 0.4
-            # Highlight FCC in green
-            green_mask_3d = np.stack([mask_green]*3, axis=-1)
-            overlay[green_mask_3d > 0] = overlay[green_mask_3d > 0] * 0.6 + np.array([80, 255, 80]) * 0.4
-            overlay = np.clip(overlay, 0, 255).astype(np.uint8)
-            st.image(overlay, caption="Overlay: 🔴 HCP ε + 🟢 FCC γ", use_column_width=True)
+            try:
+                overlay = create_overlay_safe(img_np, mask_red, mask_green)
+                st.image(overlay, caption="Overlay: 🔴 HCP ε + 🟢 FCC γ", use_column_width=True)
+            except Exception as e:
+                st.error(f"❌ Overlay creation failed: {e}")
+                st.code(traceback.format_exc())
+                # Fallback: show masks side by side
+                st.info("Showing individual masks instead")
     
-    # --- Morphological Analysis ---
+    # --- Advanced Visualizations ---
     
     st.markdown("---")
-    st.subheader("📐 Morphological Metrics")
+    st.subheader("📈 Advanced Analytics")
     
-    if not df_all.empty:
-        # Summary statistics
-        st.markdown("### 📋 Summary Statistics")
-        summary = df_all.groupby("Phase").agg({
-            "Grain ID": "count",
-            "Area (µm²)": ["mean", "std", "min", "max"],
-            "ECD (µm)": ["mean", "std"],
-            "Circularity": ["mean", "std"],
-            "Aspect Ratio": ["mean", "std"]
-        }).round(2)
-        summary.columns = ["_".join(col).strip() for col in summary.columns.values]
-        summary = summary.rename(columns={"Grain ID_count": "Grain Count"})
-        summary = summary[["Grain Count", "Area (µm²)_mean", "Area (µm²)_std", "ECD (µm)_mean", "Circularity_mean", "Aspect Ratio_mean"]]
-        st.dataframe(summary.style.format("{:.2f}"), use_container_width=True)
+    # Radar Chart for Phase Comparison
+    st.markdown("### 🎯 Radar Chart: Phase Metrics Comparison")
+    
+    try:
+        import plotly.express as px
+        import plotly.graph_objects as go
+        plotly_ok = True
+    except ImportError:
+        plotly_ok = False
+        st.warning("💡 Install plotly for interactive charts: `pip install plotly`")
+    
+    if plotly_ok and not df_all.empty:
+        radar_df = generate_radar_chart_data(df_all, area_per_pixel)
         
-        # Download button
-        filename_base = Path(uploaded_file.name if uploaded_file else selected_filename).stem
-        csv_filename = f"morphology_{filename_base}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv"
-        st.download_button(
-            label="📥 Download Grain Data (CSV)",
-            data=df_all.to_csv(index=False).encode("utf-8"),
-            file_name=csv_filename,
-            mime="text/csv",
-            help="Download detailed metrics for each detected grain"
-        )
-        
-        # Histograms with Plotly
-        st.markdown("### 📊 Grain Size Distribution")
-        
-        try:
-            import plotly.express as px
-            plotly_ok = True
-        except ImportError:
-            plotly_ok = False
-            st.warning("💡 Install plotly for interactive charts: `pip install plotly`")
-        
-        if plotly_ok:
-            hcol1, hcol2 = st.columns(2)
+        if radar_df is not None and len(radar_df) >= 2:
+            # Normalize metrics for radar chart (0-1 scale)
+            metrics_to_plot = ['Avg Area (µm²)', 'Avg ECD (µm)', 'Avg Circularity', 'Avg Aspect Ratio', 'Grain Count']
             
-            with hcol1:
-                if not df_red.empty:
-                    st.markdown("**🔴 HCP ε Phase**")
-                    fig_red = px.histogram(
-                        df_red, x="ECD (µm)", nbins=25,
-                        title="HCP ε Grain Size",
-                        labels={"ECD (µm)": "Equivalent Diameter (µm)"},
-                        color_discrete_sequence=["#e74c3c"]
-                    )
-                    fig_red.update_layout(bargap=0.1, height=300)
-                    st.plotly_chart(fig_red, use_container_width=True)
-                else:
-                    st.info("No HCP grains detected")
+            fig_radar = go.Figure()
             
-            with hcol2:
-                if not df_green.empty:
-                    st.markdown("**🟢 FCC γ Phase**")
-                    fig_green = px.histogram(
-                        df_green, x="ECD (µm)", nbins=25,
-                        title="FCC γ Grain Size", 
-                        labels={"ECD (µm)": "Equivalent Diameter (µm)"},
-                        color_discrete_sequence=["#2ecc71"]
-                    )
-                    fig_green.update_layout(bargap=0.1, height=300)
-                    st.plotly_chart(fig_green, use_container_width=True)
-                else:
-                    st.info("No FCC grains detected")
+            colors = {'HCP ε': '#e74c3c', 'FCC γ': '#2ecc71'}
             
-            # Circularity plot
-            st.markdown("### ⭕ Shape Analysis (Circularity)")
-            if not df_all.empty:
-                fig_circ = px.histogram(
-                    df_all, x="Circularity", color="Phase", nbins=25,
-                    title="Circularity Distribution (1.0 = Perfect Circle)",
-                    labels={"Circularity": "Circularity", "Phase": "Phase"},
-                    color_discrete_map={"HCP ε (Red)": "#e74c3c", "FCC γ (Green)": "#2ecc71"}
-                )
-                fig_circ.update_layout(bargap=0.1, height=350)
-                st.plotly_chart(fig_circ, use_container_width=True)
+            for idx, row in radar_df.iterrows():
+                phase_name = row['Phase']
+                color = colors.get(phase_name, '#95a5a6')
+                
+                # Normalize values for radar display
+                values = []
+                for metric in metrics_to_plot:
+                    val = row[metric]
+                    # Simple normalization (adjust ranges as needed for your data)
+                    if metric == 'Grain Count':
+                        norm_val = min(val / 100, 1.0)
+                    elif metric == 'Avg Circularity':
+                        norm_val = val  # Already 0-1
+                    elif metric == 'Avg Aspect Ratio':
+                        norm_val = min(val / 5, 1.0)
+                    else:
+                        norm_val = min(val / 100, 1.0)  # Generic normalization
+                    values.append(norm_val)
+                
+                fig_radar.add_trace(go.Scatterpolar(
+                    r=values,
+                    theta=metrics_to_plot,
+                    fill='toself',
+                    name=phase_name,
+                    line_color=color,
+                    fillcolor=color.replace(')', ', 0.2)').replace('rgb', 'rgba') if 'rgb' in color else color + '33'
+                ))
+            
+            fig_radar.update_layout(
+                polar=dict(
+                    radialaxis=dict(visible=True, range=[0, 1])
+                ),
+                showlegend=True,
+                title="Phase Metrics Comparison (Normalized)",
+                height=400
+            )
+            
+            st.plotly_chart(fig_radar, use_container_width=True)
         else:
-            # Fallback text stats
-            st.write("**HCP ε Statistics:**")
-            if not df_red.empty:
-                st.write(f"- Count: {len(df_red)} | Mean ECD: {df_red['ECD (µm)'].mean():.2f} µm | Circularity: {df_red['Circularity'].mean():.3f}")
-            st.write("**FCC γ Statistics:**")
-            if not df_green.empty:
-                st.write(f"- Count: {len(df_green)} | Mean ECD: {df_green['ECD (µm)'].mean():.2f} µm | Circularity: {df_green['Circularity'].mean():.3f}")
+            st.info("Need at least 2 phases with data for radar chart")
     
-    else:
-        st.warning("⚠️ No grains detected")
-        st.info("""
-        **Troubleshooting tips:**
-        - Check if image has clear red/green phase contrast
-        - Adjust HSV thresholds in code if needed
-        - Try enabling/disabling morphological cleaning
-        - Verify calibration matches actual image scale
+    # Chord Diagram for Phase Relationships
+    st.markdown("### 🔗 Chord Diagram: Phase Relationships")
+    
+    if plotly_ok:
+        chord_data = generate_chord_data(df_all, red_fraction, green_fraction, boundary_fraction)
+        
+        if chord_data and chord_data['links']:
+            # Create interactive chord diagram using plotly
+            nodes = chord_data['nodes']
+            links = chord_data['links']
+            
+            # Create node positions in a circle
+            n = len(nodes)
+            angles = np.linspace(0, 2*np.pi, n, endpoint=False)
+            
+            fig_chord = go.Figure()
+            
+            # Add nodes as points
+            for i, node in enumerate(nodes):
+                x, y = np.cos(angles[i]), np.sin(angles[i])
+                fig_chord.add_trace(go.Scatter(
+                    x=[x], y=[y],
+                    mode='markers+text',
+                    marker=dict(size=20, color=node['color'], line=dict(width=2, color='white')),
+                    text=[node['name']],
+                    textposition='top center',
+                    name=node['name'],
+                    hoverinfo='name',
+                    showlegend=False
+                ))
+            
+            # Add links as curved lines
+            for link in links:
+                source_idx = link['source']
+                target_idx = link['target']
+                
+                if source_idx == target_idx:
+                    # Self-loop: small circle around node
+                    x0, y0 = np.cos(angles[source_idx]), np.sin(angles[source_idx])
+                    theta = np.linspace(0, 2*np.pi, 50)
+                    r = 0.15 * link['value'] / 100
+                    x = x0 + r * np.cos(theta)
+                    y = y0 + r * np.sin(theta)
+                else:
+                    # Connection between nodes
+                    x0, y0 = np.cos(angles[source_idx]), np.sin(angles[source_idx])
+                    x1, y1 = np.cos(angles[target_idx]), np.sin(angles[target_idx])
+                    
+                    # Create curved path
+                    mid_angle = (angles[source_idx] + angles[target_idx]) / 2
+                    mid_dist = 0.5 + link['value'] / 200
+                    xm, ym = mid_dist * np.cos(mid_angle), mid_dist * np.sin(mid_angle)
+                    
+                    # Quadratic bezier curve
+                    t = np.linspace(0, 1, 50)
+                    x = (1-t)**2 * x0 + 2*(1-t)*t * xm + t**2 * x1
+                    y = (1-t)**2 * y0 + 2*(1-t)*t * ym + t**2 * y1
+                
+                fig_chord.add_trace(go.Scatter(
+                    x=x, y=y,
+                    mode='lines',
+                    line=dict(width=link['value']/20 + 1, color='rgba(100,100,100,0.5)'),
+                    hoverinfo='skip',
+                    showlegend=False,
+                    name=link.get('label', '')
+                ))
+            
+            fig_chord.update_layout(
+                title="Phase Relationship Network",
+                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.5, 1.5]),
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.5, 1.5]),
+                width=600,
+                height=500,
+                plot_bgcolor='white'
+            )
+            
+            st.plotly_chart(fig_chord, use_container_width=True)
+        else:
+            st.info("Add phase data to generate chord diagram")
+    
+    # --- Data Export Section ---
+    
+    st.markdown("---")
+    st.subheader("📥 Export Results")
+    
+    # Create comprehensive CSV
+    filename_base = Path(uploaded_file.name if uploaded_file else selected_filename).stem
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # CSV Download - Grain morphology data
+    csv_morphology = df_all.to_csv(index=False) if not df_all.empty else ""
+    st.download_button(
+        label="📊 Download Grain Morphology Data (CSV)",
+        data=csv_morphology.encode('utf-8'),
+        file_name=f"grain_morphology_{filename_base}_{timestamp}.csv",
+        mime="text/csv",
+        help="Download detailed metrics for each detected grain"
+    )
+    
+    # CSV Download - Comprehensive results
+    comprehensive_df = create_comprehensive_csv(
+        df_all, red_fraction, green_fraction, boundary_fraction,
+        red_area_abs, green_area_abs, boundary_area_abs,
+        image_info, 
+        uploaded_file.name if uploaded_file else selected_filename,
+        domain_size_um, area_per_pixel
+    )
+    csv_comprehensive = comprehensive_df.to_csv(index=False)
+    st.download_button(
+        label="📋 Download Comprehensive Analysis Report (CSV)",
+        data=csv_comprehensive.encode('utf-8'),
+        file_name=f"analysis_report_{filename_base}_{timestamp}.csv",
+        mime="text/csv",
+        help="Download complete analysis including metadata, fractions, and grain data"
+    )
+    
+    # JSON Download - For programmatic use
+    if not df_all.empty:
+        json_data = {
+            "metadata": {
+                "filename": uploaded_file.name if uploaded_file else selected_filename,
+                "timestamp": datetime.now().isoformat(),
+                "domain_size_um": domain_size_um,
+                "area_per_pixel": area_per_pixel
+            },
+            "experimental": image_info if image_info and image_info.get('valid') else None,
+            "phase_fractions": {
+                "HCP_epsilon_percent": red_fraction,
+                "FCC_gamma_percent": green_fraction,
+                "boundary_percent": boundary_fraction
+            },
+            "absolute_areas_um2": {
+                "HCP_epsilon": red_area_abs,
+                "FCC_gamma": green_area_abs,
+                "boundary": boundary_area_abs
+            },
+            "morphology_summary": {
+                phase: {
+                    "grain_count": len(df_all[df_all['Phase'] == phase]),
+                    "mean_area": df_all[df_all['Phase'] == phase]['Area (µm²)'].mean(),
+                    "mean_ecd": df_all[df_all['Phase'] == phase]['ECD (µm)'].mean(),
+                    "mean_circularity": df_all[df_all['Phase'] == phase]['Circularity'].mean()
+                }
+                for phase in df_all['Phase'].unique()
+            },
+            "grains": df_all.to_dict('records')
+        }
+        
+        json_str = json.dumps(json_data, indent=2)
+        st.download_button(
+            label="🔧 Download Analysis Data (JSON)",
+            data=json_str.encode('utf-8'),
+            file_name=f"analysis_data_{filename_base}_{timestamp}.json",
+            mime="application/json",
+            help="Download structured JSON for programmatic analysis"
+        )
+    
+    # Summary display
+    with st.expander("📄 View Analysis Summary"):
+        st.write(f"""
+        **Analysis Summary for:** `{uploaded_file.name if uploaded_file else selected_filename}`
+        
+        | Metric | HCP ε | FCC γ | Boundaries |
+        |--------|-------|-------|------------|
+        | **Area Fraction** | {red_fraction:.2f}% | {green_fraction:.2f}% | {boundary_fraction:.2f}% |
+        | **Absolute Area** | {red_area_abs:.1f} µm² | {green_area_abs:.1f} µm² | {boundary_area_abs:.1f} µm² |
+        | **Pixel Count** | {red_pixels:,} | {green_pixels:,} | {boundary_pixels:,} |
+        | **Grain Count** | {len(df_red)} | {len(df_green)} | - |
+        
+        **Experimental Conditions:**
+        - Laser: {image_info['laser_description'] if image_info and image_info.get('valid') else 'Unknown'}
+        - Heating: {image_info['heating_description'] if image_info and image_info.get('valid') else 'Unknown'}
+        - Time: {image_info['time'] if image_info and image_info.get('valid') else 'Unknown'}
+        - Orientation: {image_info['orientation_description'] if image_info and image_info.get('valid') else 'Unknown'}
         """)
 
 else:
@@ -901,7 +1128,12 @@ else:
         2. Set physical calibration (domain size in µm)
         3. Configure analysis options
         4. Review phase fractions and morphology results
-        5. Download data for further analysis
+        5. Download data in CSV or JSON format
+        
+        ### 📊 Advanced Visualizations
+        - **Radar Chart**: Compare morphological metrics between phases
+        - **Chord Diagram**: Visualize phase relationships and interfaces
+        - **Histograms**: Grain size and shape distributions
         
         ### ⚠️ BMP File Issues on Streamlit Cloud
         If BMP files fail to load:
@@ -919,7 +1151,7 @@ pillow>=10.0.0
 numpy>=1.24.0
 pandas>=2.0.0
 scikit-image>=0.21.0
-plotly>=5.17.0  # optional, for interactive charts
+plotly>=5.17.0
         """)
     
     with st.expander("🔧 Advanced: HSV Threshold Tuning"):
@@ -948,4 +1180,4 @@ plotly>=5.17.0  # optional, for interactive charts
 
 # Footer
 st.markdown("---")
-st.caption("🔬 Microstructure Phase Analyzer | HCP ε / FCC γ Quantification | Built with Streamlit + OpenCV + scikit-image")
+st.caption("🔬 Microstructure Phase Analyzer | HCP ε / FCC γ Quantification | Built with Streamlit + OpenCV + scikit-image + Plotly")
