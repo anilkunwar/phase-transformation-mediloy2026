@@ -15,3 +15,5 @@ phase transformation
 
 [![Static Badge](https://img.shields.io/badge/phimediloy-v5.0-brightgreen.svg)](https://phase-transformation-in-mediloy5.streamlit.app/) (eta and c variables both conserved)
 
+[![Static Badge](https://img.shields.io/badge/phimediloy-v6.0-brightgreen.svg)](https://phase-transformation-in-mediloy6.streamlit.app/) (eta and c variables both conserved)
+
