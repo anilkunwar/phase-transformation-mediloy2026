@@ -2,12 +2,16 @@ import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageFile
 from skimage.measure import regionprops, label
 import io
 import os
 import re
 from pathlib import Path
+import traceback
+
+# Enable PIL to load truncated images
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Page Configuration
 st.set_page_config(page_title="Microstructure Analyzer", layout="wide")
@@ -89,8 +93,9 @@ def get_script_directory():
         script_path = os.path.abspath(__file__)
         script_dir = os.path.dirname(script_path)
         return script_dir
-    except:
+    except Exception as e:
         # Fallback to current working directory
+        st.warning(f"Could not determine script directory: {e}")
         return os.getcwd()
 
 def scan_images_folder(folder_path="./images"):
@@ -131,6 +136,7 @@ def scan_images_folder(folder_path="./images"):
                 st.sidebar.write(f"**Supported extensions:** {', '.join(supported_extensions)}")
         except Exception as e:
             st.sidebar.error(f"Error reading folder: {e}")
+            st.sidebar.code(traceback.format_exc())
     else:
         st.sidebar.error(f"Folder does not exist: {abs_folder_path}")
         # Try to create it
@@ -143,23 +149,106 @@ def scan_images_folder(folder_path="./images"):
     
     return sorted(images)
 
-def convert_bmp_to_png(img_file):
-    """Convert BMP image to PNG format in memory"""
+def load_image_robust(image_path):
+    """
+    Robust image loading with multiple fallback methods
+    Handles BMP, JPG, PNG, TIFF with conversion if needed
+    """
+    st.info(f"🔄 Loading image: {image_path}")
+    
+    # Method 1: Direct PIL loading
     try:
-        img = Image.open(img_file)
+        st.write("  → Trying direct PIL load...")
+        img = Image.open(image_path)
         if img.mode in ('RGBA', 'LA', 'P'):
             img = img.convert('RGB')
         elif img.mode != 'RGB':
             img = img.convert('RGB')
-        
+        st.success("  ✓ Direct PIL load successful")
+        return img
+    except Exception as e1:
+        st.warning(f"  ✗ Direct PIL load failed: {e1}")
+    
+    # Method 2: Load with OpenCV then convert to PIL
+    try:
+        st.write("  → Trying OpenCV load...")
+        img_cv = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if img_cv is not None:
+            # OpenCV uses BGR, convert to RGB
+            img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(img_rgb)
+            st.success("  ✓ OpenCV load successful")
+            return img
+        else:
+            st.warning("  ✗ OpenCV returned None")
+    except Exception as e2:
+        st.warning(f"  ✗ OpenCV load failed: {e2}")
+    
+    # Method 3: Read file bytes and load with PIL from memory
+    try:
+        st.write("  → Trying memory buffer load...")
+        with open(image_path, 'rb') as f:
+            img_bytes = f.read()
+        buffer = io.BytesIO(img_bytes)
+        img = Image.open(buffer)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            img = img.convert('RGB')
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        st.success("  ✓ Memory buffer load successful")
+        return img
+    except Exception as e3:
+        st.warning(f"  ✗ Memory buffer load failed: {e3}")
+    
+    # Method 4: Convert BMP to JPG using OpenCV if it's a BMP file
+    file_ext = Path(image_path).suffix.lower()
+    if file_ext == '.bmp':
+        try:
+            st.write("  → Trying BMP to JPG conversion via OpenCV...")
+            img_cv = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            if img_cv is not None:
+                # Convert BGR to RGB
+                img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+                # Save to memory as JPG
+                jpg_buffer = io.BytesIO()
+                img_pil = Image.fromarray(img_rgb)
+                img_pil.save(jpg_buffer, format='JPEG', quality=95)
+                jpg_buffer.seek(0)
+                # Reload from JPG buffer
+                img_converted = Image.open(jpg_buffer)
+                if img_converted.mode != 'RGB':
+                    img_converted = img_converted.convert('RGB')
+                st.success("  ✓ BMP to JPG conversion successful")
+                return img_converted
+        except Exception as e4:
+            st.warning(f"  ✗ BMP to JPG conversion failed: {e4}")
+    
+    # All methods failed
+    st.error(f"❌ Could not load image: {image_path}")
+    st.error("Full traceback:")
+    st.code(traceback.format_exc())
+    return None
+
+def convert_image_format(img, output_format='JPEG', quality=95):
+    """Convert PIL image to specified format in memory"""
+    try:
         buffer = io.BytesIO()
-        img.save(buffer, format='PNG')
+        if output_format.upper() == 'JPEG' and img.mode in ('RGBA', 'LA', 'P'):
+            # Create white background for JPEG (doesn't support transparency)
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            background.save(buffer, format=output_format, quality=quality)
+        else:
+            if img.mode in ('RGBA', 'LA') and output_format.upper() == 'JPEG':
+                img = img.convert('RGB')
+            img.save(buffer, format=output_format, quality=quality)
         buffer.seek(0)
-        
-        return img, buffer
+        return buffer
     except Exception as e:
-        st.error(f"Error converting image: {e}")
-        return None, None
+        st.error(f"Error converting image format: {e}")
+        return None
 
 # --- Sidebar Controls ---
 st.sidebar.header("📁 Image Source")
@@ -182,6 +271,7 @@ uploaded_file = None
 selected_folder_image = None
 image_info = None
 images_folder_path = None
+selected_filename = None
 
 if source_option == "📂 From ./images/ Folder":
     # Try multiple possible paths for the images folder
@@ -264,16 +354,26 @@ if source_option == "📂 From ./images/ Folder":
             else:
                 image_path = os.path.join(images_path_used, selected_filename)
             
-            try:
-                selected_folder_image = Image.open(image_path)
-                uploaded_file = type('obj', (object,), {
-                    'name': selected_filename,
-                    'getvalue': lambda: open(image_path, 'rb').read()
-                })()
-                st.sidebar.success(f"Loaded: {selected_filename}")
-            except Exception as e:
-                st.sidebar.error(f"Error loading image: {e}")
-                st.sidebar.write(f"Full path: {image_path}")
+            st.sidebar.write(f"**Loading:** `{image_path}`")
+            
+            # Use robust loading function
+            selected_folder_image = load_image_robust(image_path)
+            
+            if selected_folder_image is not None:
+                # Create a mock uploaded_file object for compatibility
+                class MockUploadedFile:
+                    def __init__(self, name):
+                        self.name = name
+                    def getvalue(self):
+                        return None
+                
+                uploaded_file = MockUploadedFile(selected_filename)
+                st.sidebar.success(f"✅ Loaded: {selected_filename}")
+                st.sidebar.write(f"**Image mode:** {selected_folder_image.mode}")
+                st.sidebar.write(f"**Image size:** {selected_folder_image.size}")
+            else:
+                st.sidebar.error(f"❌ Failed to load: {selected_filename}")
+                st.sidebar.info("Try uploading the file manually using the upload option")
 else:
     # File upload option
     uploaded_file = st.sidebar.file_uploader(
@@ -284,6 +384,25 @@ else:
     if uploaded_file:
         # Parse uploaded filename
         image_info = parse_filename(uploaded_file.name)
+        
+        # Load uploaded image
+        try:
+            selected_folder_image = Image.open(uploaded_file)
+            if selected_folder_image.mode in ('RGBA', 'LA', 'P'):
+                selected_folder_image = selected_folder_image.convert('RGB')
+            st.sidebar.success(f"✅ Uploaded: {uploaded_file.name}")
+        except Exception as e:
+            st.sidebar.error(f"Error loading uploaded file: {e}")
+            # Try OpenCV fallback for uploaded files
+            try:
+                file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+                img_cv = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                if img_cv is not None:
+                    img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+                    selected_folder_image = Image.fromarray(img_rgb)
+                    st.sidebar.success("✅ Loaded via OpenCV fallback")
+            except Exception as e2:
+                st.sidebar.error(f"OpenCV fallback also failed: {e2}")
 
 # --- Display Experimental Conditions ---
 if image_info and image_info.get('valid'):
@@ -302,12 +421,13 @@ if image_info and image_info.get('valid'):
     
     # Show full details in expander
     with st.sidebar.expander("📋 View Full Experimental Details"):
+        filename_display = uploaded_file.name if uploaded_file else (selected_filename if selected_filename else 'N/A')
         st.write(f"""
         - **Laser Type:** {image_info['laser_description']} ({image_info['laser_type']})
         - **Heating Condition:** {image_info['heating_description']} ({image_info['heating_code']})
         - **Isothermal Time:** {image_info['time']}
         - **Sample Orientation:** {image_info['orientation_description']} ({image_info['orientation']}°)
-        - **Filename:** {uploaded_file.name if uploaded_file else (selected_filename if 'selected_filename' in locals() else 'N/A')}
+        - **Filename:** {filename_display}
         """)
 
 elif image_info and not image_info.get('valid'):
@@ -342,34 +462,21 @@ if not use_auto_threshold:
 
 # --- Main Processing Logic ---
 
-if uploaded_file is not None:
-    # Determine if we're using folder image or uploaded file
-    if selected_folder_image is not None:
-        img = selected_folder_image
-        img_np = np.array(img)
-        filename = selected_filename
-    else:
-        # Handle uploaded file
-        file_extension = uploaded_file.name.split('.')[-1].lower()
-        
-        if file_extension == 'bmp':
-            st.info("🔄 Converting BMP to PNG format...")
-            img, converted_buffer = convert_bmp_to_png(uploaded_file)
-            
-            if img is None:
-                st.error("Failed to convert BMP file.")
-                st.stop()
-            
-            st.success("✅ BMP converted successfully!")
-            img_np = np.array(img)
-        else:
-            image = Image.open(uploaded_file)
-            img_np = np.array(image)
+if uploaded_file is not None and selected_folder_image is not None:
+    # Get the numpy array from PIL image
+    img_np = np.array(selected_folder_image)
     
     # Remove Alpha channel if present
-    if img_np.shape[2] == 4:
+    if img_np.ndim == 3 and img_np.shape[2] == 4:
         img_np = img_np[:, :, :3]
-        
+        st.info("Removed alpha channel from image")
+    
+    # Ensure we have a 3-channel image
+    if img_np.ndim == 2:
+        # Grayscale to RGB
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2RGB)
+        st.info("Converted grayscale to RGB")
+    
     h, w, _ = img_np.shape
     
     # Calculate Pixel Resolution
@@ -385,6 +492,10 @@ if uploaded_file is not None:
         st.metric("Calibration", f"{area_per_pixel:.4f} µm²/px")
     with col_img3:
         st.metric("Total Area", f"{total_physical_area:.0f} µm²")
+    
+    # Display the original image
+    with st.expander("🖼️ View Original Image"):
+        st.image(img_np, caption=f"Original: {uploaded_file.name if uploaded_file else selected_filename}", use_column_width=True)
     
     # Convert to HSV for color segmentation
     hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
@@ -403,6 +514,24 @@ if uploaded_file is not None:
     lower_green = np.array([40, 70, 50])
     upper_green = np.array([80, 255, 255])
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
+
+    # Optional: Morphological operations to clean masks
+    st.sidebar.subheader("Mask Refinement")
+    apply_morphology = st.sidebar.checkbox("Apply morphological cleaning", value=True)
+    
+    if apply_morphology:
+        kernel_size = st.sidebar.slider("Kernel size for morphology", 1, 15, 3, step=2)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        
+        # Clean red mask (HCP)
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
+        
+        # Clean green mask (FCC)
+        mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
+        mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel)
+        
+        st.sidebar.info(f"Applied opening/closing with {kernel_size}x{kernel_size} kernel")
 
     # --- Calculations ---
     
@@ -455,7 +584,7 @@ if uploaded_file is not None:
             perimeter = prop.perimeter if prop.perimeter > 0 else 0.001
             circularity = (4 * np.pi * prop.area) / (perimeter ** 2)
             
-            if prop.major_axis_length > 0:
+            if prop.major_axis_length > 0 and prop.minor_axis_length > 0:
                 aspect_ratio = prop.major_axis_length / prop.minor_axis_length
             else:
                 aspect_ratio = 1.0
@@ -525,6 +654,15 @@ if uploaded_file is not None:
             st.image(mask_red, caption="HCP ε Phase (Red)", use_column_width=True)
         with c2:
             st.image(mask_green, caption="FCC γ Phase (Green)", use_column_width=True)
+        
+        # Overlay visualization
+        with st.expander("🔍 View Segmentation Overlay"):
+            overlay = img_np.copy()
+            # Add red tint for HCP
+            overlay[mask_red > 0] = overlay[mask_red > 0] * 0.7 + np.array([255, 100, 100]) * 0.3
+            # Add green tint for FCC
+            overlay[mask_green > 0] = overlay[mask_green > 0] * 0.7 + np.array([100, 255, 100]) * 0.3
+            st.image(overlay, caption="Overlay: Red=HCP ε, Green=FCC γ", use_column_width=True)
 
     st.markdown("---")
     st.subheader("📐 Morphological Metrics")
@@ -538,7 +676,8 @@ if uploaded_file is not None:
         st.dataframe(summary.style.format("{:.2f}"))
         
         # Download button
-        csv_filename = f'grain_morphology_{uploaded_file.name if uploaded_file else selected_filename}.csv'
+        filename_base = uploaded_file.name if uploaded_file else (selected_filename if selected_filename else 'analysis')
+        csv_filename = f'grain_morphology_{Path(filename_base).stem}.csv'
         st.download_button(
             label="📥 Download Detailed Grain Data (CSV)",
             data=df_all_morph.to_csv(index=False).encode('utf-8'),
@@ -564,12 +703,16 @@ if uploaded_file is not None:
                 if plotly_available:
                     fig_red = px.histogram(df_red_morph, x="ECD (µm)", nbins=20, 
                                           title="HCP ε Grain Size Distribution",
-                                          labels={"ECD (µm)": "Equivalent Diameter (µm)"})
+                                          labels={"ECD (µm)": "Equivalent Diameter (µm)"},
+                                          color_discrete_sequence=['#e74c3c'])
+                    fig_red.update_layout(bargap=0.1)
                     st.plotly_chart(fig_red, use_container_width=True)
                 else:
                     st.write(f"- Count: {len(df_red_morph)} grains")
                     st.write(f"- Mean ECD: {df_red_morph['ECD (µm)'].mean():.2f} µm")
                     st.write(f"- Std Dev: {df_red_morph['ECD (µm)'].std():.2f} µm")
+                    st.write(f"- Min: {df_red_morph['ECD (µm)'].min():.2f} µm")
+                    st.write(f"- Max: {df_red_morph['ECD (µm)'].max():.2f} µm")
         
         with col_h2:
             if not df_green_morph.empty:
@@ -577,23 +720,39 @@ if uploaded_file is not None:
                 if plotly_available:
                     fig_green = px.histogram(df_green_morph, x="ECD (µm)", nbins=20,
                                             title="FCC γ Grain Size Distribution",
-                                            labels={"ECD (µm)": "Equivalent Diameter (µm)"})
+                                            labels={"ECD (µm)": "Equivalent Diameter (µm)"},
+                                            color_discrete_sequence=['#2ecc71'])
+                    fig_green.update_layout(bargap=0.1)
                     st.plotly_chart(fig_green, use_container_width=True)
                 else:
                     st.write(f"- Count: {len(df_green_morph)} grains")
                     st.write(f"- Mean ECD: {df_green_morph['ECD (µm)'].mean():.2f} µm")
                     st.write(f"- Std Dev: {df_green_morph['ECD (µm)'].std():.2f} µm")
+                    st.write(f"- Min: {df_green_morph['ECD (µm)'].min():.2f} µm")
+                    st.write(f"- Max: {df_green_morph['ECD (µm)'].max():.2f} µm")
         
         st.markdown("### Circularity Distribution")
         if not df_all_morph.empty:
             if plotly_available:
                 fig_circ = px.histogram(df_all_morph, x="Circularity", color="Phase", 
                                        nbins=20, title="Circularity by Phase (1.0 = Perfect Circle)",
-                                       labels={"Circularity": "Circularity", "Phase": "Phase"})
+                                       labels={"Circularity": "Circularity", "Phase": "Phase"},
+                                       color_discrete_map={"HCP ε (Red)": "#e74c3c", "FCC γ (Green)": "#2ecc71"})
+                fig_circ.update_layout(bargap=0.1)
                 st.plotly_chart(fig_circ, use_container_width=True)
+            else:
+                st.write("**HCP Circularity:**")
+                if not df_red_morph.empty:
+                    st.write(f"- Mean: {df_red_morph['Circularity'].mean():.3f}")
+                    st.write(f"- Std: {df_red_morph['Circularity'].std():.3f}")
+                st.write("**FCC Circularity:**")
+                if not df_green_morph.empty:
+                    st.write(f"- Mean: {df_green_morph['Circularity'].mean():.3f}")
+                    st.write(f"- Std: {df_green_morph['Circularity'].std():.3f}")
 
     else:
-        st.warning("No grains detected. Try adjusting the image or segmentation settings.")
+        st.warning("⚠️ No grains detected. Try adjusting the image or segmentation settings.")
+        st.info("Tips: Check if your image has clear red/green phases, adjust HSV thresholds, or enable morphological cleaning")
 
 else:
     st.info("👈 Please select an image from the sidebar to begin analysis.")
@@ -614,15 +773,20 @@ else:
         ### Analysis Steps
         1. Select image source (folder or upload)
         2. Configure physical calibration (domain size)
-        3. Choose analysis options
+        3. Choose analysis options (boundary exclusion, morphology)
         4. View phase fractions and morphological data
         
-        ### Troubleshooting
-        If images are not found:
-        - Make sure the `images` folder is in the same directory as this Python script
-        - Check the sidebar for directory information
-        - Use the "Create ./images folder" button if needed
-        - Verify your image files have supported extensions: PNG, JPG, JPEG, BMP, TIFF
+        ### Troubleshooting BMP Loading Issues
+        If you see "cannot identify image file" errors:
+        - The BMP file might be corrupted or use an uncommon format
+        - Try converting the BMP to PNG/JPG using any image editor
+        - The app will automatically try multiple loading methods
+        - Check the sidebar debug output for specific error messages
+        
+        ### Supported Formats
+        - ✅ PNG, JPG, JPEG (best compatibility)
+        - ✅ BMP (with automatic conversion fallbacks)
+        - ✅ TIFF, TIF
         """)
     
     with st.expander("📦 Required Packages"):
@@ -630,4 +794,27 @@ else:
         ```bash
         pip install streamlit opencv-python-headless numpy pandas scikit-image pillow plotly
         ```
+        
+        For BMP support, ensure Pillow is up to date:
+        ```bash
+        pip install --upgrade Pillow
+        ```
+        """)
+    
+    with st.expander("🔧 Advanced: Manual HSV Threshold Adjustment"):
+        st.write("""
+        If automatic color detection isn't working well:
+        
+        **For HCP (Red phase):**
+        - Hue: 0-15 or 160-180 (red appears at both ends of HSV hue)
+        - Saturation: 70-255 (avoid gray/white)
+        - Value: 50-255 (avoid very dark pixels)
+        
+        **For FCC (Green phase):**
+        - Hue: 40-80 (green range)
+        - Saturation: 70-255
+        - Value: 50-255
+        
+        You can modify the `lower_red1`, `upper_red1`, etc. arrays in the code
+        to fine-tune detection for your specific images.
         """)
