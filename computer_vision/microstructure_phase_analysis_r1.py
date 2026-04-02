@@ -82,16 +82,64 @@ def parse_filename(filename):
             'message': f"Filename '{filename}' does not match expected pattern (e.g., CNH0.bmp, PH45.bmp)"
         }
 
+def get_script_directory():
+    """Get the directory where the script is located"""
+    try:
+        # Get the directory of the current file
+        script_path = os.path.abspath(__file__)
+        script_dir = os.path.dirname(script_path)
+        return script_dir
+    except:
+        # Fallback to current working directory
+        return os.getcwd()
+
 def scan_images_folder(folder_path="./images"):
     """Scan the images folder and return list of valid image files"""
     supported_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
     images = []
     
-    if os.path.exists(folder_path):
-        for filename in os.listdir(folder_path):
-            ext = Path(filename).suffix.lower()
-            if ext in supported_extensions:
-                images.append(filename)
+    # Get the absolute path
+    abs_folder_path = os.path.abspath(folder_path)
+    
+    st.sidebar.write(f"**Searching in:** `{abs_folder_path}`")
+    st.sidebar.write(f"**Folder exists:** {os.path.exists(abs_folder_path)}")
+    
+    if os.path.exists(abs_folder_path):
+        try:
+            all_files = os.listdir(abs_folder_path)
+            st.sidebar.write(f"**All files in folder:** {len(all_files)} items")
+            
+            # Show first few files for debugging
+            if len(all_files) > 0:
+                st.sidebar.write("**Sample files:**")
+                for f in all_files[:5]:  # Show first 5 files
+                    st.sidebar.text(f"  - {f}")
+                if len(all_files) > 5:
+                    st.sidebar.text(f"  ... and {len(all_files) - 5} more")
+            
+            for filename in all_files:
+                file_path = os.path.join(abs_folder_path, filename)
+                # Only process files (not directories)
+                if os.path.isfile(file_path):
+                    ext = Path(filename).suffix.lower()
+                    if ext in supported_extensions:
+                        images.append(filename)
+                        st.sidebar.success(f"✓ Found image: {filename}")
+            
+            if len(images) == 0:
+                st.sidebar.warning("No image files found with supported extensions")
+                st.sidebar.write(f"**Supported extensions:** {', '.join(supported_extensions)}")
+        except Exception as e:
+            st.sidebar.error(f"Error reading folder: {e}")
+    else:
+        st.sidebar.error(f"Folder does not exist: {abs_folder_path}")
+        # Try to create it
+        try:
+            os.makedirs(abs_folder_path, exist_ok=True)
+            st.sidebar.info(f"Created folder: {abs_folder_path}")
+            st.sidebar.warning("Please add image files to this folder and refresh the page")
+        except Exception as e:
+            st.sidebar.error(f"Could not create folder: {e}")
     
     return sorted(images)
 
@@ -116,6 +164,14 @@ def convert_bmp_to_png(img_file):
 # --- Sidebar Controls ---
 st.sidebar.header("📁 Image Source")
 
+# Show current directory information
+st.sidebar.subheader("📍 Directory Information")
+script_dir = get_script_directory()
+cwd = os.getcwd()
+st.sidebar.write(f"**Script location:** `{script_dir}`")
+st.sidebar.write(f"**Current working dir:** `{cwd}`")
+st.sidebar.write(f"**Same directory:** {script_dir == cwd}")
+
 # Option to choose between folder images or upload
 source_option = st.sidebar.radio(
     "Select Image Source:",
@@ -125,13 +181,73 @@ source_option = st.sidebar.radio(
 uploaded_file = None
 selected_folder_image = None
 image_info = None
+images_folder_path = None
 
 if source_option == "📂 From ./images/ Folder":
-    # Scan the images folder
-    available_images = scan_images_folder("./images")
+    # Try multiple possible paths for the images folder
+    st.sidebar.subheader("🔍 Searching for Images")
+    
+    # Possible paths to check
+    possible_paths = [
+        "./images",
+        "images",
+        os.path.join(script_dir, "images"),
+        os.path.join(cwd, "images"),
+    ]
+    
+    available_images = []
+    images_path_used = None
+    
+    for path in possible_paths:
+        abs_path = os.path.abspath(path)
+        if os.path.exists(abs_path):
+            st.sidebar.success(f"Found images folder at: `{path}`")
+            images_path_used = path
+            available_images = scan_images_folder(path)
+            images_folder_path = abs_path
+            break
+        else:
+            st.sidebar.text(f"❌ Not found: `{path}`")
+    
+    if not available_images:
+        # If still no images found, show detailed debugging
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔧 Troubleshooting")
+        st.sidebar.write("**Checked paths:**")
+        for path in possible_paths:
+            abs_path = os.path.abspath(path)
+            exists = os.path.exists(abs_path)
+            status = "✓" if exists else "✗"
+            st.sidebar.text(f"  {status} {abs_path}")
+        
+        # List what's in the script directory
+        st.sidebar.write("**Contents of script directory:**")
+        try:
+            script_contents = os.listdir(script_dir)
+            for item in script_contents[:10]:  # Show first 10 items
+                item_path = os.path.join(script_dir, item)
+                is_dir = os.path.isdir(item_path)
+                st.sidebar.text(f"  {'📁' if is_dir else '📄'} {item}")
+            if len(script_contents) > 10:
+                st.sidebar.text(f"  ... and {len(script_contents) - 10} more items")
+        except Exception as e:
+            st.sidebar.error(f"Cannot list directory: {e}")
+        
+        # Offer to create the folder
+        st.sidebar.write("**Create images folder?**")
+        if st.sidebar.button("Create ./images folder"):
+            try:
+                new_folder_path = os.path.join(script_dir, "images")
+                os.makedirs(new_folder_path, exist_ok=True)
+                st.sidebar.success(f"Created: {new_folder_path}")
+                st.sidebar.info("Please add your image files to this folder and refresh the page")
+                st.experimental_rerun()
+            except Exception as e:
+                st.sidebar.error(f"Failed to create folder: {e}")
     
     if available_images:
-        st.sidebar.success(f"Found {len(available_images)} image(s) in ./images/")
+        st.sidebar.markdown("---")
+        st.sidebar.success(f"✅ Found {len(available_images)} image(s)")
         
         selected_filename = st.sidebar.selectbox(
             "Select an image:",
@@ -143,19 +259,21 @@ if source_option == "📂 From ./images/ Folder":
             image_info = parse_filename(selected_filename)
             
             # Load the image
-            image_path = os.path.join("./images", selected_filename)
+            if images_folder_path:
+                image_path = os.path.join(images_folder_path, selected_filename)
+            else:
+                image_path = os.path.join(images_path_used, selected_filename)
+            
             try:
                 selected_folder_image = Image.open(image_path)
                 uploaded_file = type('obj', (object,), {
                     'name': selected_filename,
                     'getvalue': lambda: open(image_path, 'rb').read()
                 })()
+                st.sidebar.success(f"Loaded: {selected_filename}")
             except Exception as e:
                 st.sidebar.error(f"Error loading image: {e}")
-    else:
-        st.sidebar.warning("No images found in ./images/ folder")
-        st.sidebar.info("Please create the folder and add images, or use the upload option.")
-        
+                st.sidebar.write(f"Full path: {image_path}")
 else:
     # File upload option
     uploaded_file = st.sidebar.file_uploader(
@@ -189,7 +307,7 @@ if image_info and image_info.get('valid'):
         - **Heating Condition:** {image_info['heating_description']} ({image_info['heating_code']})
         - **Isothermal Time:** {image_info['time']}
         - **Sample Orientation:** {image_info['orientation_description']} ({image_info['orientation']}°)
-        - **Filename:** {uploaded_file.name if uploaded_file else selected_filename}
+        - **Filename:** {uploaded_file.name if uploaded_file else (selected_filename if 'selected_filename' in locals() else 'N/A')}
         """)
 
 elif image_info and not image_info.get('valid'):
@@ -420,10 +538,11 @@ if uploaded_file is not None:
         st.dataframe(summary.style.format("{:.2f}"))
         
         # Download button
+        csv_filename = f'grain_morphology_{uploaded_file.name if uploaded_file else selected_filename}.csv'
         st.download_button(
             label="📥 Download Detailed Grain Data (CSV)",
             data=df_all_morph.to_csv(index=False).encode('utf-8'),
-            file_name=f'grain_morphology_{uploaded_file.name if uploaded_file else selected_filename}.csv',
+            file_name=csv_filename,
             mime='text/csv',
         )
         
@@ -497,6 +616,13 @@ else:
         2. Configure physical calibration (domain size)
         3. Choose analysis options
         4. View phase fractions and morphological data
+        
+        ### Troubleshooting
+        If images are not found:
+        - Make sure the `images` folder is in the same directory as this Python script
+        - Check the sidebar for directory information
+        - Use the "Create ./images folder" button if needed
+        - Verify your image files have supported extensions: PNG, JPG, JPEG, BMP, TIFF
         """)
     
     with st.expander("📦 Required Packages"):
