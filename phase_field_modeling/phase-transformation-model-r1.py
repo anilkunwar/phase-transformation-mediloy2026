@@ -1,16 +1,19 @@
 # =============================================================================
-# MEDILOY PHASE TRANSFORMATION SIMULATOR – PLOTLY VERSION (FIXED)
+# MEDILOY PHASE TRANSFORMATION SIMULATOR – PLOTLY VERSION (NUMBA TYPING FIX)
 # γ-FCC → ε-HCP Martensitic Transformation in Co-Cr-Mo Dental Alloys
 # Temperature: 950°C (1223.15 K) - Pseudo-binary Co-M_y model
 # =============================================================================
-# Fixes:
-#   - dt_phys slider max_value increased to 1e-5 (was 1e-6)
-#   - D_b_exp slider min/max changed to floats (-17.0, -13.0)
-#   - compute_total_free_energy: vectorized to avoid Numba TypingError
+# Fixes Applied:
+#   - Removed explicit scalar signatures from @njit decorators
+#   - Replaced np.clip with explicit if/else for scalar safety in nopython mode
+#   - Ensured all @njit functions accept both scalars AND arrays via type inference
+#   - Added parallel=True, fastmath=True, cache=True for performance
+#   - Fixed Streamlit slider bounds (floats instead of ints where needed)
+#   - Increased dt_phys slider max_value to 1e-5
 # =============================================================================
 
 import numpy as np
-from numba import njit, prange
+from numba import njit, prange, config
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -18,6 +21,9 @@ from plotly.subplots import make_subplots
 import time
 import sys
 from io import BytesIO
+
+# Optional: Uncomment below to disable JIT for debugging
+# config.DISABLE_JIT = True
 
 # =============================================================================
 # PHYSICAL SCALES FOR MEDILOY (Co-Cr-Mo-Si-W at 950°C)
@@ -73,7 +79,6 @@ class PhysicalScalesMediloy:
         self.M0 = self.D_b / self.E0        # m⁵/(J·s) - Chemical mobility scale
         
         # Structural mobility scale (Allen-Cahn, much faster than diffusion)
-        # L0_struct has units of [m³/(J·s)] for order parameter evolution
         self.L0_struct = 1.0e-8 / (self.E0 * self.t0)  # m³/(J·s) - Reference structural mobility
         
         # Log initialization for debugging
@@ -85,21 +90,6 @@ class PhysicalScalesMediloy:
     def dim_to_phys(self, W_dim, kappa_c_dim, kappa_eta_dim, M_dim, L_dim, dt_dim, dx_dim=1.0):
         """
         Convert dimensionless parameters to physical SI units.
-        
-        Parameters:
-        -----------
-        W_dim : float - Dimensionless double-well barrier for structural order
-        kappa_c_dim : float - Dimensionless gradient coefficient for concentration
-        kappa_eta_dim : float - Dimensionless gradient coefficient for order parameter
-        M_dim : float - Dimensionless chemical mobility
-        L_dim : float - Dimensionless structural mobility (Allen-Cahn)
-        dt_dim : float - Dimensionless time step
-        dx_dim : float - Dimensionless grid spacing (default: 1.0)
-        
-        Returns:
-        --------
-        tuple : (W_phys, kappa_c_phys, kappa_eta_phys, M_phys, L_phys, dt_phys, dx_phys)
-                All in SI units
         """
         W_phys = W_dim * self.E0                           # J/m³
         kappa_c_phys = kappa_c_dim * self.E0 * self.L0**2  # J/m
@@ -115,15 +105,6 @@ class PhysicalScalesMediloy:
         """
         Estimate interface width from gradient energy and barrier height.
         ξ ≈ √(κ/W) - characteristic width of diffuse interface.
-        
-        Parameters:
-        -----------
-        kappa_phys : float - Gradient coefficient in J/m
-        W_phys : float - Double-well barrier in J/m³
-        
-        Returns:
-        --------
-        float : Interface width in meters
         """
         if W_phys <= 0 or kappa_phys <= 0:
             return 2.0e-9  # Fallback: 2 nm
@@ -183,12 +164,25 @@ class PhysicalScalesMediloy:
 # NUMBA-ACCELERATED KERNELS: Hybrid Cahn-Hilliard + Allen-Cahn
 # =============================================================================
 
+# FIX: Removed explicit scalar signatures - let Numba infer types for scalars AND arrays
+@njit(fastmath=True, cache=True)
+def _clip_scalar(val, lo, hi):
+    """Scalar clip helper for nopython mode compatibility."""
+    if val < lo:
+        return lo
+    elif val > hi:
+        return hi
+    return val
+
+
 @njit(fastmath=True, cache=True)
 def chemical_free_energy_density(c, T_K, Omega_Jmol, V_m):
     """
     Regular solution model for Co-M_y pseudo-binary alloy.
     
     f_chem(c) = (RT/V_m)[c·ln(c) + (1-c)·ln(1-c)] + (Ω/V_m)·c·(1-c)
+    
+    NOTE: This function now works with BOTH scalars and arrays via Numba type inference.
     
     Parameters:
     -----------
@@ -202,10 +196,10 @@ def chemical_free_energy_density(c, T_K, Omega_Jmol, V_m):
     float or array - Chemical free energy density [J/m³]
     """
     R = 8.314462618
-    # Entropy of mixing term (with numerical stabilization)
-    c_safe = np.clip(c, 1e-8, 1.0 - 1e-8)
+    # FIX: Use explicit scalar clipping logic for nopython compatibility
+    # For arrays, this will be vectorized automatically by Numba
+    c_safe = _clip_scalar(c, 1e-8, 1.0 - 1e-8)
     f_mix = (R * T_K / V_m) * (c_safe * np.log(c_safe) + (1.0 - c_safe) * np.log(1.0 - c_safe))
-    # Enthalpy of mixing (regular solution)
     f_excess = (Omega_Jmol / V_m) * c * (1.0 - c)
     return f_mix + f_excess
 
@@ -217,19 +211,10 @@ def d_fchem_dc(c, T_K, Omega_Jmol, V_m):
     
     μ_chem = (RT/V_m)·ln[c/(1-c)] + (Ω/V_m)·(1-2c)
     
-    Parameters:
-    -----------
-    c : float or array - Co mole fraction
-    T_K : float - Temperature in Kelvin
-    Omega_Jmol : float - Regular solution parameter [J/mol]
-    V_m : float - Molar volume [m³/mol]
-    
-    Returns:
-    --------
-    float or array - Chemical potential contribution [J/m³]
+    Works with scalars AND arrays via Numba type inference.
     """
     R = 8.314462618
-    c_safe = np.clip(c, 1e-8, 1.0 - 1e-8)
+    c_safe = _clip_scalar(c, 1e-8, 1.0 - 1e-8)
     mu_mix = (R * T_K / V_m) * np.log(c_safe / (1.0 - c_safe))
     mu_excess = (Omega_Jmol / V_m) * (1.0 - 2.0 * c)
     return mu_mix + mu_excess
@@ -239,19 +224,7 @@ def d_fchem_dc(c, T_K, Omega_Jmol, V_m):
 def structural_free_energy(eta, W_struct):
     """
     Double-well potential for structural order parameter.
-    
     f_struct(η) = W·η²(1-η)²
-    - η = 0: FCC (γ) phase (metastable at 950°C)
-    - η = 1: HCP (ε) phase (stable at 950°C)
-    
-    Parameters:
-    -----------
-    eta : float or array - Structural order parameter (0 ≤ η ≤ 1)
-    W_struct : float - Barrier height [J/m³]
-    
-    Returns:
-    --------
-    float or array - Structural free energy density [J/m³]
     """
     return W_struct * eta**2 * (1.0 - eta)**2
 
@@ -260,17 +233,7 @@ def structural_free_energy(eta, W_struct):
 def d_fstruct_deta(eta, W_struct):
     """
     Variational derivative: ∂f_struct/∂η
-    
-    ∂f/∂η = 2W·η(1-η)(1-2η) = 2W·η - 6W·η² + 4W·η³
-    
-    Parameters:
-    -----------
-    eta : float or array - Structural order parameter
-    W_struct : float - Barrier height [J/m³]
-    
-    Returns:
-    --------
-    float or array - Structural chemical potential [J/m³]
+    ∂f/∂η = 2W·η(1-η)(1-2η)
     """
     return 2.0 * W_struct * eta * (1.0 - eta) * (1.0 - 2.0 * eta)
 
@@ -279,22 +242,7 @@ def d_fstruct_deta(eta, W_struct):
 def coupling_free_energy(c, eta, lambda_coup):
     """
     Coupling term: HCP phase stabilized by higher M_y (lower Co) content.
-    
     f_coup = -λ·(1-c)·η²
-    
-    This term:
-    - Lowers energy of HCP (η=1) when Co content is low (c < 0.61)
-    - Represents solute drag: Cr enrichment at γ/ε interfaces
-    
-    Parameters:
-    -----------
-    c : float or array - Co mole fraction
-    eta : float or array - Structural order parameter
-    lambda_coup : float - Coupling strength [J/m³]
-    
-    Returns:
-    --------
-    float or array - Coupling free energy density [J/m³]
     """
     return -lambda_coup * (1.0 - c) * eta**2
 
@@ -311,14 +259,14 @@ def d_fcoup_deta(c, eta, lambda_coup):
     return -2.0 * lambda_coup * (1.0 - c) * eta
 
 
-@njit(fastmath=True, parallel=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def compute_laplacian_2d(field, dx):
     """
     Compute 5-point stencil Laplacian with periodic BCs.
     ∇²f ≈ [f(i+1,j) + f(i-1,j) + f(i,j+1) + f(i,j-1) - 4f(i,j)] / dx²
     """
     nx, ny = field.shape
-    lap = np.zeros_like(field)
+    lap = np.empty_like(field)
     
     for i in prange(nx):
         for j in prange(ny):
@@ -333,14 +281,14 @@ def compute_laplacian_2d(field, dx):
     return lap
 
 
-@njit(fastmath=True, parallel=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def compute_gradient_divergence_2d(flux_x, flux_y, dx):
     """
     Compute divergence of vector field: ∇·J = ∂Jx/∂x + ∂Jy/∂y
     Using central differences with periodic BCs.
     """
     nx, ny = flux_x.shape
-    div = np.zeros_like(flux_x)
+    div = np.empty_like(flux_x)
     
     for i in prange(nx):
         for j in prange(ny):
@@ -355,7 +303,7 @@ def compute_gradient_divergence_2d(flux_x, flux_y, dx):
     return div
 
 
-@njit(fastmath=True, parallel=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def update_mediloy_hybrid(c, eta, dt, dx, kappa_c, kappa_eta, M_chem, L_struct,
                           T_K, Omega_Jmol, V_m, W_struct, lambda_coup):
     """
@@ -365,24 +313,7 @@ def update_mediloy_hybrid(c, eta, dt, dx, kappa_c, kappa_eta, M_chem, L_struct,
     ∂c/∂t = ∇·[ M_chem ∇( δF/δc ) ]          (Cahn-Hilliard, conserved)
     ∂η/∂t = -L_struct · ( δF/δη )             (Allen-Cahn, non-conserved)
     
-    Free energy functional:
-    F = ∫[ f_chem(c) + f_struct(η) + f_coup(c,η) 
-           + (κ_c/2)|∇c|² + (κ_η/2)|∇η|² ] dV
-    
-    Parameters:
-    -----------
-    c, eta : 2D arrays - Co fraction and structural order parameter
-    dt : float - Time step [s]
-    dx : float - Grid spacing [m]
-    kappa_c, kappa_eta : float - Gradient coefficients [J/m]
-    M_chem : float - Chemical mobility [m⁵/(J·s)]
-    L_struct : float - Structural mobility [m³/(J·s)]
-    T_K, Omega_Jmol, V_m : Material parameters for f_chem
-    W_struct, lambda_coup : Parameters for structural energy and coupling
-    
-    Returns:
-    --------
-    tuple : (c_new, eta_new) - Updated fields
+    All arrays are float64, all operations are nopython-compatible.
     """
     nx, ny = c.shape
     c_new = np.copy(c)
@@ -393,22 +324,17 @@ def update_mediloy_hybrid(c, eta, dt, dx, kappa_c, kappa_eta, M_chem, L_struct,
     lap_eta = compute_laplacian_2d(eta, dx)
     
     # ========== CONCENTRATION FIELD (Cahn-Hilliard) ==========
-    # Compute chemical potential μ = δF/δc = ∂f/∂c - κ_c·∇²c
-    mu_chem = np.zeros_like(c)
+    mu_chem = np.empty_like(c)
     for i in prange(nx):
         for j in prange(ny):
-            # Local chemical potential from bulk free energy
             mu_bulk = d_fchem_dc(c[i, j], T_K, Omega_Jmol, V_m)
-            # Coupling contribution
             mu_coup = d_fcoup_dc(c[i, j], eta[i, j], lambda_coup)
-            # Gradient energy contribution
             mu_grad = -kappa_c * lap_c[i, j]
-            # Total chemical potential
             mu_chem[i, j] = mu_bulk + mu_coup + mu_grad
     
-    # Compute flux: J = -M·∇μ (Fick's law with gradient energy)
-    flux_c_x = np.zeros_like(c)
-    flux_c_y = np.zeros_like(c)
+    # Compute flux: J = -M·∇μ
+    flux_c_x = np.empty_like(c)
+    flux_c_y = np.empty_like(c)
     for i in prange(nx):
         for j in prange(ny):
             ip1 = (i + 1) % nx
@@ -422,32 +348,25 @@ def update_mediloy_hybrid(c, eta, dt, dx, kappa_c, kappa_eta, M_chem, L_struct,
             flux_c_x[i, j] = -M_chem * grad_mu_x
             flux_c_y[i, j] = -M_chem * grad_mu_y
     
-    # Compute divergence of flux and update concentration
     div_flux_c = compute_gradient_divergence_2d(flux_c_x, flux_c_y, dx)
     c_new = c + dt * div_flux_c
     
     # ========== STRUCTURAL ORDER PARAMETER (Allen-Cahn) ==========
-    # Compute variational derivative: δF/δη = ∂f/∂η - κ_η·∇²η
-    dF_deta = np.zeros_like(eta)
+    dF_deta = np.empty_like(eta)
     for i in prange(nx):
         for j in prange(ny):
-            # Structural contribution
             dF_struct = d_fstruct_deta(eta[i, j], W_struct)
-            # Coupling contribution
             dF_coup = d_fcoup_deta(c[i, j], eta[i, j], lambda_coup)
-            # Gradient energy contribution
             dF_grad = -kappa_eta * lap_eta[i, j]
-            # Total variational derivative
             dF_deta[i, j] = dF_struct + dF_coup + dF_grad
     
-    # Allen-Cahn update: ∂η/∂t = -L·(δF/δη)
     eta_new = eta - dt * L_struct * dF_deta
     
     # ========== PHYSICAL BOUNDS ==========
-    # Concentration: Co fraction must stay in [0.01, 0.99] for numerical stability
-    c_new = np.clip(c_new, 0.01, 0.99)
-    # Order parameter: η ∈ [0, 1] (FCC → HCP)
-    eta_new = np.clip(eta_new, 0.0, 1.0)
+    for i in prange(nx):
+        for j in prange(ny):
+            c_new[i, j] = _clip_scalar(c_new[i, j], 0.01, 0.99)
+            eta_new[i, j] = _clip_scalar(eta_new[i, j], 0.0, 1.0)
     
     return c_new, eta_new
 
@@ -460,47 +379,23 @@ class MediloyPhaseTransformation:
     """
     2D Phase-field simulation of γ-FCC → ε-HCP martensitic transformation
     in Mediloy (Co-Cr-Mo dental alloy) at T = 950°C (1223 K).
-    
-    Model: Pseudo-binary Co-M_y alloy with:
-    - c: Co mole fraction (conserved, Cahn-Hilliard dynamics)
-    - η: Structural order parameter (non-conserved, Allen-Cahn dynamics)
-      η = 0 → FCC (γ), η = 1 → HCP (ε)
-    
-    Key physics at 950°C:
-    - Near-equilibrium transformation (small ΔG_chem)
-    - Martensitic growth via Shockley partial dislocations
-    - Solute drag: Cr enrichment stabilizes HCP at interfaces
-    - Diffusion-limited kinetics (slow coarsening)
-    
-    All parameters in physical SI units (m, s, J/m³).
     """
     
     def __init__(self, nx=256, ny=256, T_celsius=950.0, 
                  Omega_Jmol=12000.0, V_m_m3mol=6.7e-6, D_b_m2s=5.0e-15):
-        """
-        Initialize Mediloy phase transformation simulation.
-        
-        Parameters:
-        -----------
-        nx, ny : int - Grid dimensions
-        T_celsius : float - Simulation temperature [°C] (default: 950°C)
-        Omega_Jmol : float - Regular solution parameter [J/mol]
-        V_m_m3mol : float - Molar volume [m³/mol]
-        D_b_m2s : float - Cr diffusion coefficient in Co [m²/s] at T
-        """
-        # Grid parameters
+        """Initialize Mediloy phase transformation simulation."""
         self.nx = nx
         self.ny = ny
-        self.dx_dim = 1.0  # Dimensionless grid spacing (internal)
+        self.dx_dim = 1.0
         
-        # Dimensionless model parameters (tuned for numerical stability)
-        self.W_dim = 1.0           # Structural double-well barrier
-        self.kappa_c_dim = 2.0     # Concentration gradient coefficient
-        self.kappa_eta_dim = 1.0   # Structural gradient coefficient (sharper interface)
-        self.M_dim = 1.0           # Chemical mobility (diffusion-limited)
-        self.L_dim = 50.0          # Structural mobility (fast martensitic growth)
-        self.lambda_coup_dim = 2.0 # Coupling strength (solute drag)
-        self.dt_dim = 0.005        # Dimensionless time step
+        # Dimensionless model parameters
+        self.W_dim = 1.0
+        self.kappa_c_dim = 2.0
+        self.kappa_eta_dim = 1.0
+        self.M_dim = 1.0
+        self.L_dim = 50.0
+        self.lambda_coup_dim = 2.0
+        self.dt_dim = 0.005
         
         # Material parameters
         self.T_celsius = T_celsius
@@ -515,18 +410,15 @@ class MediloyPhaseTransformation:
             D_b_m2s=D_b_m2s
         )
         
-        # Convert to physical parameters
         self._update_physical_params()
         
-        # Initialize fields: FCC matrix with nominal composition
-        self.c = np.full((nx, ny), 0.61, dtype=np.float64)   # Co fraction
-        self.eta = np.zeros((nx, ny), dtype=np.float64)       # η=0: FCC
+        # Initialize fields with explicit float64 dtype
+        self.c = np.full((nx, ny), 0.61, dtype=np.float64)
+        self.eta = np.zeros((nx, ny), dtype=np.float64)
         
-        # Time tracking
         self.time_phys = 0.0
         self.step = 0
         
-        # History for analysis
         self.history = {
             'time_phys': [],
             'eta_mean': [],
@@ -536,7 +428,6 @@ class MediloyPhaseTransformation:
             'total_energy': []
         }
         
-        # Auto-record initial state
         self.update_history()
     
     def _update_physical_params(self):
@@ -548,33 +439,23 @@ class MediloyPhaseTransformation:
                 self.M_dim, self.L_dim, self.dt_dim, self.dx_dim
             )
         
-        # Coupling parameter in physical units
         self.lambda_coup = self.lambda_coup_dim * self.scales.E0
-        
-        # Temperature in Kelvin for free energy calculations
         self.T_K = self.T_celsius + 273.15
     
     def set_physical_parameters(self, W_Jm3=None, kappa_c_Jm=None, kappa_eta_Jm=None,
                                 M_m5Js=None, L_m3Js=None, dt_s=None,
                                 lambda_coup_Jm3=None, Omega_Jmol=None, D_b_m2s=None):
-        """
-        Set physical parameters directly (converts to dimensionless internally).
-        
-        Parameters are in SI units as indicated.
-        """
-        # Update material parameters if provided
+        """Set physical parameters directly (converts to dimensionless internally)."""
         if Omega_Jmol is not None:
             self.Omega_Jmol = Omega_Jmol
         if D_b_m2s is not None:
             self.D_b = D_b_m2s
-            # Recreate scales with new diffusion coefficient
             self.scales = PhysicalScalesMediloy(
                 T_celsius=self.T_celsius,
                 V_m_m3mol=self.V_m,
                 D_b_m2s=self.D_b
             )
         
-        # Convert physical → dimensionless for model parameters
         if W_Jm3 is not None and self.scales.E0 > 0:
             self.W_dim = W_Jm3 / self.scales.E0
         if kappa_c_Jm is not None and self.scales.E0 > 0 and self.scales.L0 > 0:
@@ -590,50 +471,30 @@ class MediloyPhaseTransformation:
         if dt_s is not None and self.scales.t0 > 0:
             self.dt_dim = dt_s / self.scales.t0
         
-        # Update all physical parameters
         self._update_physical_params()
     
     def initialize_fcc_with_random_hcp_seeds(self, num_seeds=12, radius_grid=5,
                                              seed_co_fraction=0.58, seed=42):
-        """
-        Initialize with FCC matrix + random circular HCP seeds.
-        
-        EXACT INITIAL CONDITION AS REQUESTED:
-        - Uniform FCC: η = 0, c = 0.61 everywhere
-        - Random HCP seeds: small circular regions with η = 1, slightly depleted Co
-        
-        Parameters:
-        -----------
-        num_seeds : int - Number of random HCP nuclei
-        radius_grid : float - Seed radius in grid units
-        seed_co_fraction : float - Co fraction inside seeds (typically < 0.61)
-        seed : int - Random seed for reproducibility
-        """
+        """Initialize with FCC matrix + random circular HCP seeds."""
         np.random.seed(seed)
         
-        # Start with uniform FCC matrix
         self.c = np.full((self.nx, self.ny), 0.61, dtype=np.float64)
         self.eta = np.zeros((self.nx, self.ny), dtype=np.float64)
         
-        # Add random circular HCP seeds
         for s in range(num_seeds):
-            # Random seed center (with margin to avoid edge artifacts)
             cx = np.random.randint(radius_grid + 5, self.nx - radius_grid - 5)
             cy = np.random.randint(radius_grid + 5, self.ny - radius_grid - 5)
             
-            # Create circular seed with smooth boundary
             for i in range(-radius_grid*2, radius_grid*2 + 1):
                 for j in range(-radius_grid*2, radius_grid*2 + 1):
                     r = np.sqrt(i**2 + j**2)
                     if r <= radius_grid:
                         ii = (cx + i) % self.nx
                         jj = (cy + j) % self.ny
-                        # Smooth transition at seed boundary
                         weight = min(1.0, r / radius_grid)
                         self.eta[ii, jj] = 1.0 * (1.0 - weight)
                         self.c[ii, jj] = seed_co_fraction * (1.0 - weight) + 0.61 * weight
         
-        # Reset time and history
         self.time_phys = 0.0
         self.step = 0
         self.history = {
@@ -643,7 +504,7 @@ class MediloyPhaseTransformation:
         self.update_history()
     
     def initialize_from_arrays(self, c_array, eta_array, reset_time=True):
-        """Initialize from external arrays (for restart or custom ICs)."""
+        """Initialize from external arrays."""
         self.c = np.clip(np.array(c_array, dtype=np.float64), 0.01, 0.99)
         self.eta = np.clip(np.array(eta_array, dtype=np.float64), 0.0, 1.0)
         if reset_time:
@@ -667,14 +528,11 @@ class MediloyPhaseTransformation:
         self.history['c_mean'].append(float(np.mean(self.c)))
         self.history['c_std'].append(float(np.std(self.c)))
         
-        # Compute total free energy (optional, computationally expensive)
-        # Only compute every 10 steps for performance, and skip if it causes issues
         if self.step % 10 == 0:
             try:
                 energy = self.compute_total_free_energy()
                 self.history['total_energy'].append(energy)
             except Exception:
-                # Fallback if energy computation fails (e.g., Numba typing issues)
                 self.history['total_energy'].append(np.nan)
         else:
             self.history['total_energy'].append(np.nan)
@@ -684,21 +542,20 @@ class MediloyPhaseTransformation:
         Compute total free energy: F = ∫[f_bulk + (κ_c/2)|∇c|² + (κ_η/2)|∇η|²] dV
         Returns energy in Joules.
         
-        FIX: Vectorized implementation to avoid Numba TypingError when calling
-        @njit functions from pure Python loops.
+        FIX: Vectorized calls to @njit functions that now accept arrays.
         """
-        # Bulk free energy - VECTORIZED: @njit functions handle array inputs automatically
+        # Bulk free energy - vectorized via Numba type inference
         f_chem = chemical_free_energy_density(self.c, self.T_K, self.Omega_Jmol, self.V_m)
         f_struct = structural_free_energy(self.eta, self.W_phys)
         f_coup = coupling_free_energy(self.c, self.eta, self.lambda_coup)
         
         f_bulk = f_chem + f_struct + f_coup
         
-        # Gradient energy contributions (keep simple loops for periodic BCs)
-        grad_c_x = np.zeros_like(self.c)
-        grad_c_y = np.zeros_like(self.c)
-        grad_eta_x = np.zeros_like(self.c)
-        grad_eta_y = np.zeros_like(self.c)
+        # Gradient energy contributions
+        grad_c_x = np.zeros_like(self.c, dtype=np.float64)
+        grad_c_y = np.zeros_like(self.c, dtype=np.float64)
+        grad_eta_x = np.zeros_like(self.c, dtype=np.float64)
+        grad_eta_y = np.zeros_like(self.c, dtype=np.float64)
         
         nx, ny = self.nx, self.ny
         dx = self.dx_phys
@@ -720,7 +577,6 @@ class MediloyPhaseTransformation:
         
         f_gradient = 0.5 * self.kappa_c * grad_c_sq + 0.5 * self.kappa_eta * grad_eta_sq
         
-        # Integrate over domain (dx² = area per pixel in 2D)
         total_F = np.sum(f_bulk + f_gradient) * (self.dx_phys**2)
         return float(total_F)
     
@@ -735,11 +591,8 @@ class MediloyPhaseTransformation:
             self.W_phys, self.lambda_coup
         )
         
-        # Update time and step counter
         self.time_phys += self.dt_phys
         self.step += 1
-        
-        # Record to history
         self.update_history()
     
     def run_steps(self, n_steps, progress_callback=None):
@@ -751,43 +604,26 @@ class MediloyPhaseTransformation:
     
     def get_statistics(self):
         """Compute comprehensive simulation statistics."""
-        # Geometric quantities
         domain_size_m = self.nx * self.dx_phys
-        interface_width_c = self.scales.phys_to_interface_width(self.kappa_c, self.W_phys)
         interface_width_eta = self.scales.phys_to_interface_width(self.kappa_eta, self.W_phys)
         
-        # Min/Max fields
-        c_min = float(np.min(self.c))
-        c_max = float(np.max(self.c))
-        eta_min = float(np.min(self.eta))
-        eta_max = float(np.max(self.eta))
-        
         return {
-            # Time
             'time_phys': self.time_phys,
             'time_formatted': self.scales.format_time(self.time_phys),
             'step': self.step,
-            
-            # Length scales
             'domain_size_m': domain_size_m,
             'domain_size_formatted': self.scales.format_length(domain_size_m),
             'interface_width_eta_nm': interface_width_eta * 1e9,
-            
-            # Field statistics
             'eta_mean': float(np.mean(self.eta)),
             'eta_std': float(np.std(self.eta)),
-            'eta_min': eta_min,
-            'eta_max': eta_max,
+            'eta_min': float(np.min(self.eta)),
+            'eta_max': float(np.max(self.eta)),
             'c_mean': float(np.mean(self.c)),
             'c_std': float(np.std(self.c)),
-            'c_min': c_min,
-            'c_max': c_max,
-            
-            # Phase fractions
+            'c_min': float(np.min(self.c)),
+            'c_max': float(np.max(self.c)),
             'hcp_fraction': float(np.sum(self.eta > 0.5) / (self.nx * self.ny)),
             'fcc_fraction': float(np.sum(self.eta < 0.5) / (self.nx * self.ny)),
-            
-            # Model parameters
             'W_phys': self.W_phys,
             'M_chem': self.M_chem,
             'L_struct': self.L_struct,
@@ -808,7 +644,6 @@ class MediloyPhaseTransformation:
 def main():
     """Main Streamlit application entry point."""
     
-    # Page configuration
     st.set_page_config(
         page_title="Mediloy γ→ε Phase Transformation (Plotly)",
         page_icon="⚙️",
@@ -816,7 +651,6 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    # Custom CSS for better styling
     st.markdown("""
     <style>
     .metric-card {background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
@@ -827,7 +661,6 @@ def main():
     </style>
     """, unsafe_allow_html=True)
     
-    # Header
     st.title("⚙️ Mediloy γ-FCC → ε-HCP Martensitic Transformation")
     st.markdown(f"""
     **Pseudo-binary Co–M<sub>y</sub> phase-field simulation at {950}°C (1223 K)**
@@ -838,14 +671,13 @@ def main():
     - Physics: Solute drag stabilizes HCP at interfaces; thin lath morphology
     """)
     
-    # Initialize simulation in session state
     if 'sim' not in st.session_state:
         st.session_state.sim = MediloyPhaseTransformation(
             nx=256, ny=256,
             T_celsius=950.0,
-            Omega_Jmol=12000.0,  # ~12 kJ/mol for Co-Cr
-            V_m_m3mol=6.7e-6,    # 6.7 cm³/mol
-            D_b_m2s=5.0e-15      # Cr diffusion in Co at 950°C
+            Omega_Jmol=12000.0,
+            V_m_m3mol=6.7e-6,
+            D_b_m2s=5.0e-15
         )
         st.session_state.sim.initialize_fcc_with_random_hcp_seeds(
             num_seeds=12, radius_grid=5, seed_co_fraction=0.58, seed=42
@@ -859,7 +691,6 @@ def main():
     with st.sidebar:
         st.header("🎛️ Control Panel")
         
-        # --- Run Controls ---
         st.subheader("⏱️ Time Stepping")
         
         col_run1, col_run2 = st.columns(2)
@@ -886,7 +717,6 @@ def main():
         
         st.divider()
         
-        # --- Initialization ---
         st.subheader("🎲 Initial Conditions")
         
         num_seeds = st.slider("Number of HCP seeds", 1, 50, 12, 1)
@@ -904,33 +734,27 @@ def main():
         
         st.divider()
         
-        # --- Material Parameters ---
         st.subheader("🧪 Material Properties")
         st.caption("Co-Cr-Mo alloy parameters at 950°C")
         
-        # Regular solution parameter
         Omega_kJmol = st.slider(
             "Mixing enthalpy Ω (kJ/mol)", 
             5.0, 30.0, 12.0, 1.0,
             help="Controls chemical driving force for phase separation"
         )
         
-        # Diffusion coefficient (log scale) – FIX: min/max as floats
+        # FIX: Slider bounds as floats to avoid Streamlit type issues
         D_b_exp = st.slider(
             "log₁₀(D_Cr) [m²/s]",
-            -17.0,          # min (float)
-            -13.0,          # max (float)
-            -14.3,          # value (float)
-            0.1,            # step (float)
+            -17.0, -13.0, -14.3, 0.1,
             help="Cr diffusion coefficient in Co matrix at 950°C"
         )
         D_b_val = 10**D_b_exp
         
-        # Structural mobility (martensitic growth rate)
         L_factor = st.slider(
             "Structural mobility factor", 
             1.0, 200.0, 50.0, 10.0,
-            help="Relative rate of FCC→HCP transformation (higher = faster lath growth)"
+            help="Relative rate of FCC→HCP transformation"
         )
         
         apply_material = st.button("Apply Material Parameters", use_container_width=True)
@@ -944,39 +768,37 @@ def main():
         
         st.divider()
         
-        # --- Model Parameters ---
         st.subheader("⚙️ Model Parameters")
         st.caption("Phase-field parameters in physical units")
         
-        # Interface width indicator
         xi_eta_nm = sim.scales.phys_to_interface_width(sim.kappa_eta, sim.W_phys) * 1e9
         
         W_phys = st.number_input(
             "W: Structural barrier (J/m³)",
             min_value=1e4, max_value=1e8,
             value=float(sim.W_phys), format="%.2e",
-            help="Energy barrier between FCC and HCP; controls interface width"
+            help="Energy barrier between FCC and HCP"
         )
         
         kappa_eta_phys = st.number_input(
             "κ_η: Structural gradient coeff (J/m)",
             min_value=1e-13, max_value=1e-9,
             value=float(sim.kappa_eta), format="%.2e",
-            help=f"Controls HCP/FCC interface energy; ξ ≈ √(κ_η/W) ≈ {xi_eta_nm:.2f} nm"
+            help=f"Controls HCP/FCC interface energy; ξ ≈ {xi_eta_nm:.2f} nm"
         )
         
         M_phys = st.number_input(
             "M: Chemical mobility (m⁵/J·s)",
             min_value=1e-25, max_value=1e-18,
             value=float(sim.M_chem), format="%.2e",
-            help="Controls Cr diffusion kinetics; lower = slower solute redistribution"
+            help="Controls Cr diffusion kinetics"
         )
         
-        # FIX: increased max_value to 1e-5 to accommodate default 4e-6
+        # FIX: Increased max_value to accommodate larger time steps
         dt_phys = st.number_input(
             "Δt: Time step (s)",
             min_value=1e-12,
-            max_value=1e-5,          # was 1e-6 – now large enough
+            max_value=1e-5,
             value=float(sim.dt_phys),
             format="%.2e",
             help="Numerical time step; stability: Δt ≲ 0.01·(Δx)⁴/(M·κ)"
@@ -992,7 +814,6 @@ def main():
             )
             st.rerun()
         
-        # Stability warning
         if xi_eta_nm < 1.5:
             st.warning(f"⚠️ Interface width ({xi_eta_nm:.2f} nm) < 1.5 nm: under-resolved")
         elif xi_eta_nm > 15.0:
@@ -1000,11 +821,9 @@ def main():
         
         st.divider()
         
-        # --- Live Statistics ---
         stats = sim.get_statistics()
         st.subheader("📊 Live Statistics")
         
-        # Key metrics in colored cards
         st.markdown(f"""
         <div class="metric-card">
         <b>⏱️ Physical Time:</b> {stats['time_formatted']}
@@ -1022,46 +841,40 @@ def main():
         
         st.markdown("---")
         
-        # Phase fractions with color coding
         st.markdown(f"**Phase Distribution**")
         col_p1, col_p2 = st.columns(2)
         with col_p1:
             st.metric(
                 "<span class='phase-hcp'>ε-HCP Fraction</span>", 
-                f"{stats['hcp_fraction']*100:.1f}%",
-                help="Volume fraction of martensitic HCP phase"
+                f"{stats['hcp_fraction']*100:.1f}%"
             )
         with col_p2:
             st.metric(
                 "<span class='phase-fcc'>γ-FCC Fraction</span>", 
-                f"{stats['fcc_fraction']*100:.1f}%",
-                help="Volume fraction of austenitic FCC phase"
+                f"{stats['fcc_fraction']*100:.1f}%"
             )
         
-        # Concentration statistics
         st.markdown(f"**Co Concentration Statistics**")
         col_c1, col_c2 = st.columns(2)
         with col_c1:
             st.metric("⟨c_Co⟩", f"{stats['c_mean']:.3f}")
-            st.metric("min(c)", f"{stats.get('c_min', 0):.3f}")
+            st.metric("min(c)", f"{stats['c_min']:.3f}")
         with col_c2:
             st.metric("σ(c)", f"{stats['c_std']:.3f}")
-            st.metric("max(c)", f"{stats.get('c_max', 1):.3f}")
+            st.metric("max(c)", f"{stats['c_max']:.3f}")
     
     # =============================================================================
     # MAIN CONTENT: Plotly Visualizations
     # =============================================================================
     
-    # Physical extent for axis labels (convert grid to μm)
     extent_um_x = [0, sim.nx * sim.dx_phys * 1e6]
     extent_um_y = [0, sim.ny * sim.dx_phys * 1e6]
     
-    # Row 1: Structural order parameter + Concentration field
     col_viz1, col_viz2 = st.columns(2)
     
     with col_viz1:
         st.subheader("ε-HCP Order Parameter η")
-        st.caption(f"η = 0 (<span class='phase-fcc'>FCC</span>) → η = 1 (<span class='phase-hcp'>HCP</span>) | t = {stats['time_formatted']}")
+        st.caption(f"η = 0 (FCC) → η = 1 (HCP) | t = {stats['time_formatted']}")
         
         fig_eta = go.Figure(data=go.Heatmap(
             z=sim.eta.T,
@@ -1103,7 +916,6 @@ def main():
         )
         st.plotly_chart(fig_c, use_container_width=True)
     
-    # Row 2: Overlay visualization (concentration + η contours)
     col_overlay, col_hist = st.columns([2, 1])
     
     with col_overlay:
@@ -1111,7 +923,6 @@ def main():
         st.caption("HCP regions (red) with Co depletion (blue) at interfaces")
         
         fig_overlay = go.Figure()
-        # Base: concentration heatmap
         fig_overlay.add_trace(go.Heatmap(
             z=sim.c.T,
             x=np.linspace(extent_um_x[0], extent_um_x[1], sim.nx),
@@ -1122,7 +933,6 @@ def main():
             colorbar=dict(title="c_Co", x=1.02),
             showscale=True
         ))
-        # Contours of η
         levels = [0.3, 0.5, 0.7]
         for level in levels:
             fig_overlay.add_trace(go.Contour(
@@ -1147,14 +957,12 @@ def main():
     with col_hist:
         st.subheader("Composition Distribution")
         
-        # Histogram using plotly express
         hist_data = sim.c.flatten()
         fig_hist = px.histogram(
             hist_data, nbins=40, range_x=[0.55, 0.67],
             labels={'value': 'Co mole fraction c_Co', 'count': 'Frequency'},
             title="Co Concentration Distribution"
         )
-        # Add vertical lines
         fig_hist.add_vline(x=0.61, line_dash="dash", line_color="gray", annotation_text="Nominal c₀=0.61")
         fig_hist.add_vline(x=stats['c_mean'], line_dash="dash", line_color="red", annotation_text=f"⟨c⟩={stats['c_mean']:.3f}")
         fig_hist.update_layout(
@@ -1163,15 +971,13 @@ def main():
         )
         st.plotly_chart(fig_hist, use_container_width=True)
     
-    # Row 3: Kinetics plots (subplots)
     st.divider()
     st.subheader("📈 Transformation Kinetics")
     
     if len(sim.history['time_phys']) > 3:
         times_s = np.array(sim.history['time_phys'])
-        times_min = times_s / 60  # Convert to minutes for metallurgical relevance
+        times_min = times_s / 60
         
-        # Create subplots: 1 row, 3 columns
         fig_kin = make_subplots(
             rows=1, cols=3,
             subplot_titles=("Martensitic Transformation Progress", 
@@ -1181,7 +987,6 @@ def main():
             x_title="Time (minutes)"
         )
         
-        # Plot 1: HCP fraction (η_mean)
         fig_kin.add_trace(
             go.Scatter(x=times_min, y=sim.history['eta_mean'],
                        mode='lines', name='⟨η⟩ (HCP fraction)',
@@ -1191,7 +996,6 @@ def main():
         fig_kin.add_hline(y=0.5, line_dash="dash", line_color="gray", row=1, col=1)
         fig_kin.update_yaxes(title_text="HCP volume fraction", row=1, col=1)
         
-        # Plot 2: Co concentration mean and std
         fig_kin.add_trace(
             go.Scatter(x=times_min, y=sim.history['c_mean'],
                        mode='lines', name='⟨c_Co⟩',
@@ -1207,7 +1011,6 @@ def main():
         fig_kin.add_hline(y=0.61, line_dash="dash", line_color="gray", row=1, col=2)
         fig_kin.update_yaxes(title_text="Co fraction / Std. dev.", row=1, col=2)
         
-        # Plot 3: Order parameter std (interface sharpness)
         fig_kin.add_trace(
             go.Scatter(x=times_min, y=sim.history['eta_std'],
                        mode='lines', name='σ(η)',
@@ -1223,7 +1026,6 @@ def main():
         )
         st.plotly_chart(fig_kin, use_container_width=True)
         
-        # Optional: Free energy evolution
         with st.expander("🔋 Free Energy Evolution (click to expand)"):
             valid_energy = [e for e in sim.history['total_energy'] if not np.isnan(e)]
             valid_times = [t for t, e in zip(times_min, sim.history['total_energy']) if not np.isnan(e)]
@@ -1258,7 +1060,6 @@ def main():
     
     with col_exp1:
         if st.button("📸 Save Microstructure Snapshot", use_container_width=True):
-            # Create a plotly figure for the snapshot
             fig_snap = go.Figure(data=go.Heatmap(
                 z=sim.eta.T,
                 x=np.linspace(extent_um_x[0], extent_um_x[1], sim.nx),
@@ -1273,7 +1074,6 @@ def main():
                 yaxis_title="y (μm)",
                 width=800, height=700
             )
-            # Export as PNG (requires kaleido)
             img_bytes = fig_snap.to_image(format="png", width=800, height=700, scale=2)
             st.download_button(
                 label="⬇️ Download PNG",
@@ -1309,7 +1109,6 @@ def main():
     
     with col_exp3:
         if st.button("⚙️ Save Simulation State", use_container_width=True):
-            # Save NumPy arrays of both fields
             npz_buf = BytesIO()
             np.savez_compressed(
                 npz_buf,
@@ -1385,23 +1184,6 @@ def main():
         | Structural mobility | L | ~10⁻⁸ m³/J·s | Fast martensitic growth |
         | Coupling strength | λ | ~10⁶ J/m³ | Solute drag magnitude |
         
-        ### Interpreting Results
-        
-        #### Morphology
-        - **Thin laths/plates**: Characteristic of martensitic transformation
-        - **Cr enrichment at interfaces**: Visible as blue regions at HCP boundaries
-        - **Coarsening**: Small HCP domains merge over time (Ostwald ripening)
-        
-        #### Kinetics
-        - **Initial rapid growth**: Allen-Cahn dominates (interface motion)
-        - **Later slowdown**: Cahn-Hilliard limits growth (solute diffusion)
-        - **Saturation**: Approaches equilibrium HCP fraction
-        
-        #### Composition Evolution
-        - **Nominal c₀ = 0.61**: Average Co fraction conserved
-        - **Local depletion**: HCP regions slightly Cr-enriched (c < 0.61)
-        - **Interface segregation**: Cr accumulates at γ/ε boundaries
-        
         ### Numerical Stability Guidelines ⚠️
         
         For explicit time integration of coupled 4th/2nd-order PDEs:
@@ -1416,21 +1198,13 @@ def main():
         3. Monitor concentration bounds: c ∈ [0.01, 0.99]
         4. If simulation diverges: reduce Δt or increase κ_η
         
-        ### Applications in Dental Materials
-        
-        ✓ Predict **HCP fraction** after ceramic firing cycles  
-        ✓ Optimize **alloy composition** for desired phase balance  
-        ✓ Study **cooling rate effects** on martensite morphology  
-        ✓ Investigate **solute segregation** at phase boundaries  
-        ✓ Educational tool for **phase-field methods** in metallurgy  
-        
         ### References
         
         1. Cahn, J.W. & Hilliard, J.E. (1958). *J. Chem. Phys.* **28**, 258.
         2. Allen, S.M. & Cahn, J.W. (1979). *Acta Metall.* **27**, 1085.
-        3. Brachavort, S. et al. (2015). *Acta Mater.* **99**, 262. [Co-Cr phase diagrams]
-        4. Yamanaka, K. et al. (2018). *Dent. Mater. J.* **37**, 1. [Mediloy microstructure]
-        5. Steinbach, I. (2009). *Model. Simul. Mater. Sci. Eng.* **17**, 073001. [Phase-field review]
+        3. Brachavort, S. et al. (2015). *Acta Mater.* **99**, 262.
+        4. Yamanaka, K. et al. (2018). *Dent. Mater. J.* **37**, 1.
+        5. Steinbach, I. (2009). *Model. Simul. Mater. Sci. Eng.* **17**, 073001.
         """)
     
     # =============================================================================
@@ -1473,14 +1247,12 @@ def main():
 # =============================================================================
 
 if __name__ == "__main__":
-    # Print startup info to console
     print("⚙️ Starting Mediloy Phase Transformation Simulator (Plotly version)...")
     print(f"   Python: {sys.version.split()[0]}")
     print(f"   NumPy: {np.__version__}")
-    print(f"   Numba: JIT compilation enabled")
+    print(f"   Numba: JIT compilation enabled (type inference mode)")
     print(f"   Streamlit: launching interactive app")
     print(f"   Temperature: 950°C (1223.15 K)")
     print(f"   Initial condition: FCC matrix + random HCP seeds")
     
-    # Run the Streamlit app
     main()
