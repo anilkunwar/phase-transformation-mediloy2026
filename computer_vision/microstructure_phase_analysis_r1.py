@@ -31,7 +31,67 @@ It calculates **phase fractions**, **area fractions**, and morphological metrics
 - `N` = 0 (0°) or 45 (45° orientation)
 """)
 
+# --- Color Constants for Consistent Visualization ---
+HCP_COLOR_RGB = "rgb(231, 76, 60)"      # Red for HCP ε phase
+HCP_COLOR_HEX = "#e74c3c"
+FCC_COLOR_RGB = "rgb(46, 204, 113)"     # Green for FCC γ phase  
+FCC_COLOR_HEX = "#2ecc71"
+BOUNDARY_COLOR_RGB = "rgb(149, 165, 166)"  # Gray for boundaries
+BOUNDARY_COLOR_HEX = "#95a5a6"
+
 # --- Helper Functions ---
+
+def to_rgba(color, alpha=0.25):
+    """
+    Safely convert rgb/rgba/hex color to rgba string with desired opacity.
+    Handles various input formats and ensures Plotly-compatible output.
+    
+    Args:
+        color: Color string in format 'rgb(r,g,b)', 'rgba(r,g,b,a)', or '#rrggbb'
+        alpha: Opacity value between 0.0 and 1.0
+    
+    Returns:
+        Valid rgba color string for Plotly
+    """
+    import re
+    
+    if not isinstance(color, str):
+        # Handle numpy types or other non-string inputs
+        return f"rgba(100, 100, 100, {alpha})"
+    
+    color = color.strip()
+    
+    # If already rgba, just adjust alpha
+    if color.startswith('rgba'):
+        match = re.match(r'rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*[\d.]+)?\s*\)', color)
+        if match:
+            r, g, b = match.groups()[:3]
+            return f'rgba({r}, {g}, {b}, {alpha})'
+    
+    # If rgb format
+    if color.startswith('rgb'):
+        match = re.match(r'rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', color)
+        if match:
+            r, g, b = match.groups()
+            return f'rgba({r}, {g}, {b}, {alpha})'
+    
+    # If hex format (#rrggbb or #rgb)
+    if color.startswith('#'):
+        hex_color = color.lstrip('#')
+        if len(hex_color) == 3:
+            # Expand short form #rgb to #rrggbb
+            hex_color = ''.join([c*2 for c in hex_color])
+        if len(hex_color) == 6:
+            try:
+                r = int(hex_color[0:2], 16)
+                g = int(hex_color[2:4], 16)
+                b = int(hex_color[4:6], 16)
+                return f'rgba({r}, {g}, {b}, {alpha})'
+            except ValueError:
+                pass
+    
+    # Fallback: return original color (Plotly will use default opacity)
+    return color
 
 def parse_filename(filename):
     """Parse filename according to convention: ABN.ext"""
@@ -290,27 +350,20 @@ def load_image_robust(image_path):
     return None
 
 def create_overlay_safe(img_np, mask_red, mask_green):
-    """Create segmentation overlay with proper dtype handling - FIXES THE VALUE ERROR"""
-    # Convert to float32 for safe arithmetic operations
+    """Create segmentation overlay with proper dtype handling"""
     overlay = img_np.astype(np.float32).copy()
-    
-    # Create 3D masks for broadcasting
     red_mask_3d = np.stack([mask_red] * 3, axis=-1).astype(bool)
     green_mask_3d = np.stack([mask_green] * 3, axis=-1).astype(bool)
     
-    # Apply red tint for HCP phase (with proper float arithmetic)
     if np.any(red_mask_3d):
         red_tint = np.array([255, 80, 80], dtype=np.float32)
         overlay[red_mask_3d] = overlay[red_mask_3d] * 0.6 + red_tint * 0.4
     
-    # Apply green tint for FCC phase
     if np.any(green_mask_3d):
         green_tint = np.array([80, 255, 80], dtype=np.float32)
         overlay[green_mask_3d] = overlay[green_mask_3d] * 0.6 + green_tint * 0.4
     
-    # Clip to valid range and convert back to uint8
     overlay = np.clip(overlay, 0, 255).astype(np.uint8)
-    
     return overlay
 
 def generate_radar_chart_data(df_all, area_per_pixel):
@@ -338,37 +391,30 @@ def generate_radar_chart_data(df_all, area_per_pixel):
 
 def generate_chord_data(df_all, red_fraction, green_fraction, boundary_fraction):
     """Generate data for chord diagram showing phase relationships"""
-    # Nodes: phases and their interactions
     nodes = [
-        {"name": "HCP ε", "color": "#e74c3c"},
-        {"name": "FCC γ", "color": "#2ecc71"},
-        {"name": "Boundaries", "color": "#95a5a6"}
+        {"name": "HCP ε", "color": HCP_COLOR_HEX},
+        {"name": "FCC γ", "color": FCC_COLOR_HEX},
+        {"name": "Boundaries", "color": BOUNDARY_COLOR_HEX}
     ]
     
-    # Links: represent area fractions and morphological relationships
     links = []
-    
-    # Add fraction-based links (normalized to 100)
     total = red_fraction + green_fraction + boundary_fraction
+    
     if total > 0:
-        # Self-loops representing phase abundance
         links.append({"source": 0, "target": 0, "value": red_fraction / total * 100, "label": f"HCP ε: {red_fraction:.1f}%"})
         links.append({"source": 1, "target": 1, "value": green_fraction / total * 100, "label": f"FCC γ: {green_fraction:.1f}%"})
         links.append({"source": 2, "target": 2, "value": boundary_fraction / total * 100, "label": f"Boundaries: {boundary_fraction:.1f}%"})
         
-        # Cross-phase interaction links (representing interface area)
-        interface_strength = min(red_fraction, green_fraction) * 0.5  # Simplified metric
+        interface_strength = min(red_fraction, green_fraction) * 0.5
         if interface_strength > 0:
             links.append({"source": 0, "target": 1, "value": interface_strength, "label": "HCP-FCC Interface"})
             links.append({"source": 1, "target": 0, "value": interface_strength, "label": "FCC-HCP Interface"})
     
-    # Add morphological correlation links if data available
     if not df_all.empty:
         hcp_df = df_all[df_all['Phase'].str.contains('HCP', case=False, na=False)]
         fcc_df = df_all[df_all['Phase'].str.contains('FCC', case=False, na=False)]
         
         if not hcp_df.empty and not fcc_df.empty:
-            # Correlation based on circularity similarity
             hcp_circ = hcp_df['Circularity'].mean()
             fcc_circ = fcc_df['Circularity'].mean()
             circ_similarity = 1 - abs(hcp_circ - fcc_circ)
@@ -389,30 +435,25 @@ def create_comprehensive_csv(df_all, red_fraction, green_fraction, boundary_frac
     """Create comprehensive CSV with all analysis results"""
     results = []
     
-    # Metadata section
     results.append({"Category": "METADATA", "Parameter": "Filename", "Value": filename, "Unit": ""})
     results.append({"Category": "METADATA", "Parameter": "Analysis Timestamp", "Value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Unit": ""})
     results.append({"Category": "METADATA", "Parameter": "Domain Size", "Value": domain_size_um, "Unit": "µm"})
     results.append({"Category": "METADATA", "Parameter": "Area per Pixel", "Value": area_per_pixel, "Unit": "µm²/px"})
     
-    # Experimental conditions if parsed
     if image_info and image_info.get('valid'):
         results.append({"Category": "EXPERIMENT", "Parameter": "Laser Type", "Value": image_info['laser_description'], "Unit": ""})
         results.append({"Category": "EXPERIMENT", "Parameter": "Heating Condition", "Value": image_info['heating_description'], "Unit": ""})
         results.append({"Category": "EXPERIMENT", "Parameter": "Isothermal Time", "Value": image_info['time'], "Unit": ""})
         results.append({"Category": "EXPERIMENT", "Parameter": "Orientation", "Value": f"{image_info['orientation']}°", "Unit": "degrees"})
     
-    # Phase fractions
     results.append({"Category": "PHASE_FRACTIONS", "Parameter": "HCP ε Fraction", "Value": red_fraction, "Unit": "%"})
     results.append({"Category": "PHASE_FRACTIONS", "Parameter": "FCC γ Fraction", "Value": green_fraction, "Unit": "%"})
     results.append({"Category": "PHASE_FRACTIONS", "Parameter": "Boundary Fraction", "Value": boundary_fraction, "Unit": "%"})
     
-    # Absolute areas
     results.append({"Category": "ABSOLUTE_AREAS", "Parameter": "HCP ε Area", "Value": red_area_abs, "Unit": "µm²"})
     results.append({"Category": "ABSOLUTE_AREAS", "Parameter": "FCC γ Area", "Value": green_area_abs, "Unit": "µm²"})
     results.append({"Category": "ABSOLUTE_AREAS", "Parameter": "Boundary Area", "Value": boundary_area_abs, "Unit": "µm²"})
     
-    # Summary statistics per phase
     if not df_all.empty:
         for phase in df_all['Phase'].unique():
             phase_df = df_all[df_all['Phase'] == phase]
@@ -425,7 +466,6 @@ def create_comprehensive_csv(df_all, red_fraction, green_fraction, boundary_frac
             results.append({"Category": f"SUMMARY_{phase_name}", "Parameter": "Mean Circularity", "Value": phase_df['Circularity'].mean(), "Unit": ""})
             results.append({"Category": f"SUMMARY_{phase_name}", "Parameter": "Mean Aspect Ratio", "Value": phase_df['Aspect Ratio'].mean(), "Unit": ""})
     
-    # Individual grain data
     for _, row in df_all.iterrows():
         results.append({
             "Category": "GRAIN_DATA",
@@ -445,7 +485,6 @@ def create_comprehensive_csv(df_all, red_fraction, green_fraction, boundary_frac
 # --- Sidebar Controls ---
 st.sidebar.header("📁 Image Source")
 
-# Directory information
 st.sidebar.subheader("📍 Environment Info")
 script_dir = get_script_directory()
 cwd = os.getcwd()
@@ -454,7 +493,6 @@ st.sidebar.write(f"**🔄 Working dir:** `{cwd}`")
 st.sidebar.write(f"**🎯 Same location:** {script_dir == cwd}")
 st.sidebar.write(f"**☁️ Streamlit Cloud:** {'Yes' if '/mount/src/' in cwd else 'No (Local)'}")
 
-# Image source selection
 source_option = st.sidebar.radio(
     "Select Image Source:",
     ["📂 From ./images/ Folder", "📤 Upload Custom Image"]
@@ -672,27 +710,22 @@ if apply_morphology:
 # --- Main Processing Logic ---
 
 if uploaded_file is not None and selected_folder_image is not None:
-    # Convert PIL to numpy array
     img_np = np.array(selected_folder_image)
     
-    # Handle alpha channel
     if img_np.ndim == 3 and img_np.shape[2] == 4:
         st.info("🎨 Detected alpha channel - converting to RGB")
         img_np = img_np[:, :, :3]
     
-    # Handle grayscale
     if img_np.ndim == 2:
         st.info("⚫ Detected grayscale - converting to RGB")
         img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2RGB)
     
     h, w, _ = img_np.shape
     
-    # Calculate calibration
     total_physical_area = domain_size_um ** 2
     total_pixels = h * w
     area_per_pixel = total_physical_area / total_pixels
     
-    # Display image metrics
     col_img1, col_img2, col_img3 = st.columns(3)
     with col_img1:
         st.metric("🖼️ Resolution", f"{w} × {h}", "pixels")
@@ -701,14 +734,11 @@ if uploaded_file is not None and selected_folder_image is not None:
     with col_img3:
         st.metric("🌐 Total Area", f"{total_physical_area:,.0f}", "µm²")
     
-    # Show original image in expander
     with st.expander("🖼️ View Original Image"):
         st.image(img_np, caption=f"Original: {uploaded_file.name if uploaded_file else selected_filename}", use_column_width=True)
     
-    # Convert to HSV for segmentation
     hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
     
-    # HSV ranges for HCP epsilon (Red phase)
     lower_red1 = np.array([0, 70, 50])
     upper_red1 = np.array([15, 255, 255])
     lower_red2 = np.array([160, 70, 50])
@@ -718,12 +748,10 @@ if uploaded_file is not None and selected_folder_image is not None:
     mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
     mask_red = cv2.bitwise_or(mask1, mask2)
     
-    # HSV ranges for FCC gamma (Green phase)
     lower_green = np.array([40, 70, 50])
     upper_green = np.array([80, 255, 255])
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
     
-    # Apply morphological operations if enabled
     if apply_morphology:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         
@@ -735,8 +763,6 @@ if uploaded_file is not None and selected_folder_image is not None:
         
         st.sidebar.info(f"✨ Applied {morphology_iterations}× morphology with {kernel_size}×{kernel_size} kernel")
     
-    # --- Quantification Calculations ---
-    
     red_pixels = int(cv2.countNonZero(mask_red))
     green_pixels = int(cv2.countNonZero(mask_green))
     boundary_pixels = total_pixels - red_pixels - green_pixels
@@ -745,7 +771,6 @@ if uploaded_file is not None and selected_folder_image is not None:
     green_area_abs = green_pixels * area_per_pixel
     boundary_area_abs = boundary_pixels * area_per_pixel
     
-    # Area fractions based on mode
     if exclude_boundaries:
         total_phase_pixels = red_pixels + green_pixels
         if total_phase_pixels > 0:
@@ -761,7 +786,6 @@ if uploaded_file is not None and selected_folder_image is not None:
         boundary_fraction = (boundary_pixels / total_pixels) * 100
         st.info("📊 **Mode:** Absolute fractions (includes boundaries)")
     
-    # Morphological analysis function
     def analyze_morphology(mask, phase_name, area_per_pixel):
         labeled = label(mask)
         props = regionprops(labeled)
@@ -829,7 +853,6 @@ if uploaded_file is not None and selected_folder_image is not None:
             f3.metric("⚪ Boundary", f"{boundary_fraction:.1f}%")
             st.caption("📏 Includes grain boundaries")
         
-        # Bar chart
         st.markdown("### 📊 Phase Distribution")
         if exclude_boundaries:
             chart_df = pd.DataFrame({
@@ -851,7 +874,6 @@ if uploaded_file is not None and selected_folder_image is not None:
         with c2:
             st.image(mask_green, caption="🟢 FCC γ Mask", use_column_width=True)
         
-        # Overlay visualization - FIXED VERSION
         with st.expander("🔍 View Segmentation Overlay"):
             try:
                 overlay = create_overlay_safe(img_np, mask_red, mask_green)
@@ -859,7 +881,6 @@ if uploaded_file is not None and selected_folder_image is not None:
             except Exception as e:
                 st.error(f"❌ Overlay creation failed: {e}")
                 st.code(traceback.format_exc())
-                # Fallback: show masks side by side
                 st.info("Showing individual masks instead")
     
     # --- Advanced Visualizations ---
@@ -867,7 +888,7 @@ if uploaded_file is not None and selected_folder_image is not None:
     st.markdown("---")
     st.subheader("📈 Advanced Analytics")
     
-    # Radar Chart for Phase Comparison
+    # Radar Chart for Phase Comparison - FIXED VERSION
     st.markdown("### 🎯 Radar Chart: Phase Metrics Comparison")
     
     try:
@@ -879,143 +900,200 @@ if uploaded_file is not None and selected_folder_image is not None:
         st.warning("💡 Install plotly for interactive charts: `pip install plotly`")
     
     if plotly_ok and not df_all.empty:
-        radar_df = generate_radar_chart_data(df_all, area_per_pixel)
-        
-        if radar_df is not None and len(radar_df) >= 2:
-            # Normalize metrics for radar chart (0-1 scale)
-            metrics_to_plot = ['Avg Area (µm²)', 'Avg ECD (µm)', 'Avg Circularity', 'Avg Aspect Ratio', 'Grain Count']
+        try:
+            radar_df = generate_radar_chart_data(df_all, area_per_pixel)
             
-            fig_radar = go.Figure()
-            
-            colors = {'HCP ε': '#e74c3c', 'FCC γ': '#2ecc71'}
-            
-            for idx, row in radar_df.iterrows():
-                phase_name = row['Phase']
-                color = colors.get(phase_name, '#95a5a6')
+            if radar_df is not None and len(radar_df) >= 2:
+                metrics_to_plot = ['Avg Area (µm²)', 'Avg ECD (µm)', 'Avg Circularity', 'Avg Aspect Ratio', 'Grain Count']
                 
-                # Normalize values for radar display
-                values = []
-                for metric in metrics_to_plot:
-                    val = row[metric]
-                    # Simple normalization (adjust ranges as needed for your data)
-                    if metric == 'Grain Count':
-                        norm_val = min(val / 100, 1.0)
-                    elif metric == 'Avg Circularity':
-                        norm_val = val  # Already 0-1
-                    elif metric == 'Avg Aspect Ratio':
-                        norm_val = min(val / 5, 1.0)
-                    else:
-                        norm_val = min(val / 100, 1.0)  # Generic normalization
-                    values.append(norm_val)
+                fig_radar = go.Figure()
                 
-                fig_radar.add_trace(go.Scatterpolar(
-                    r=values,
-                    theta=metrics_to_plot,
-                    fill='toself',
-                    name=phase_name,
-                    line_color=color,
-                    fillcolor=color.replace(')', ', 0.2)').replace('rgb', 'rgba') if 'rgb' in color else color + '33'
-                ))
-            
-            fig_radar.update_layout(
-                polar=dict(
-                    radialaxis=dict(visible=True, range=[0, 1])
-                ),
-                showlegend=True,
-                title="Phase Metrics Comparison (Normalized)",
-                height=400
-            )
-            
-            st.plotly_chart(fig_radar, use_container_width=True)
-        else:
-            st.info("Need at least 2 phases with data for radar chart")
+                # Color mapping for phases
+                phase_colors = {
+                    'HCP ε': HCP_COLOR_RGB,
+                    'FCC γ': FCC_COLOR_RGB
+                }
+                
+                for idx, row in radar_df.iterrows():
+                    phase_name = row['Phase']
+                    color = phase_colors.get(phase_name, BOUNDARY_COLOR_RGB)
+                    
+                    # Normalize values for radar display (0-1 scale)
+                    values = []
+                    for metric in metrics_to_plot:
+                        val = row[metric]
+                        if pd.isna(val) or val is None:
+                            values.append(0)
+                        elif metric == 'Grain Count':
+                            norm_val = min(val / 100, 1.0)
+                        elif metric == 'Avg Circularity':
+                            norm_val = min(val, 1.0)  # Already 0-1 range
+                        elif metric == 'Avg Aspect Ratio':
+                            norm_val = min(val / 5, 1.0)  # Normalize assuming max aspect ratio ~5
+                        elif metric == 'Avg Area (µm²)':
+                            norm_val = min(val / 100, 1.0)  # Adjust divisor based on your data scale
+                        elif metric == 'Avg ECD (µm)':
+                            norm_val = min(val / 50, 1.0)  # Adjust divisor based on your data scale
+                        else:
+                            norm_val = min(val / 100, 1.0)
+                        values.append(norm_val)
+                    
+                    # Use the robust to_rgba function for fillcolor
+                    fillcolor = to_rgba(color, alpha=0.25)
+                    
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=values,
+                        theta=metrics_to_plot,
+                        fill='toself',
+                        fillcolor=fillcolor,  # FIXED: Using safe RGBA conversion
+                        line=dict(color=color, width=2),
+                        name=phase_name,
+                        hovertemplate='<b>%{fullData.name}</b><br>' +
+                                    '%{theta}: %{r:.2f}<extra></extra>'
+                    ))
+                
+                fig_radar.update_layout(
+                    polar=dict(
+                        radialaxis=dict(
+                            visible=True, 
+                            range=[0, 1],
+                            tickformat='.0%',
+                            gridcolor='rgba(200,200,200,0.3)'
+                        ),
+                        bgcolor='rgba(255,255,255,0)'
+                    ),
+                    showlegend=True,
+                    title="Phase Metrics Comparison (Normalized to 0-1)",
+                    height=450,
+                    margin=dict(l=40, r=40, t=50, b=40),
+                    plot_bgcolor='white',
+                    paper_bgcolor='white'
+                )
+                
+                st.plotly_chart(fig_radar, use_container_width=True)
+                
+                # Add interpretation help
+                with st.expander("📖 How to Read the Radar Chart"):
+                    st.write("""
+                    - **Each axis** represents a morphological metric (normalized to 0-1 scale)
+                    - **Larger area** = higher values for that metric
+                    - **Overlap** between phases indicates similar morphology
+                    - **Grain Count**: Higher = more grains detected
+                    - **Avg Circularity**: Closer to 1.0 = more circular grains
+                    - **Avg Aspect Ratio**: Higher = more elongated grains
+                    - **Avg Area/ECD**: Larger = bigger grains
+                    
+                    *Note: Values are normalized for visualization. See tables below for actual values.*
+                    """)
+            else:
+                st.info("ℹ️ Need at least 2 phases with grain data for radar chart comparison")
+                
+        except Exception as radar_error:
+            st.warning(f"⚠️ Radar chart display issue: {radar_error}")
+            st.info("✅ The rest of your analysis (fractions, morphology, exports) is still working correctly!")
+            with st.expander("🔍 Radar Chart Debug Info"):
+                st.code(f"Error type: {type(radar_error).__name__}\n{traceback.format_exc()}")
     
     # Chord Diagram for Phase Relationships
     st.markdown("### 🔗 Chord Diagram: Phase Relationships")
     
     if plotly_ok:
-        chord_data = generate_chord_data(df_all, red_fraction, green_fraction, boundary_fraction)
-        
-        if chord_data and chord_data['links']:
-            # Create interactive chord diagram using plotly
-            nodes = chord_data['nodes']
-            links = chord_data['links']
+        try:
+            chord_data = generate_chord_data(df_all, red_fraction, green_fraction, boundary_fraction)
             
-            # Create node positions in a circle
-            n = len(nodes)
-            angles = np.linspace(0, 2*np.pi, n, endpoint=False)
-            
-            fig_chord = go.Figure()
-            
-            # Add nodes as points
-            for i, node in enumerate(nodes):
-                x, y = np.cos(angles[i]), np.sin(angles[i])
-                fig_chord.add_trace(go.Scatter(
-                    x=[x], y=[y],
-                    mode='markers+text',
-                    marker=dict(size=20, color=node['color'], line=dict(width=2, color='white')),
-                    text=[node['name']],
-                    textposition='top center',
-                    name=node['name'],
-                    hoverinfo='name',
-                    showlegend=False
-                ))
-            
-            # Add links as curved lines
-            for link in links:
-                source_idx = link['source']
-                target_idx = link['target']
+            if chord_data and chord_data['links']:
+                nodes = chord_data['nodes']
+                links = chord_data['links']
                 
-                if source_idx == target_idx:
-                    # Self-loop: small circle around node
-                    x0, y0 = np.cos(angles[source_idx]), np.sin(angles[source_idx])
-                    theta = np.linspace(0, 2*np.pi, 50)
-                    r = 0.15 * link['value'] / 100
-                    x = x0 + r * np.cos(theta)
-                    y = y0 + r * np.sin(theta)
-                else:
-                    # Connection between nodes
-                    x0, y0 = np.cos(angles[source_idx]), np.sin(angles[source_idx])
-                    x1, y1 = np.cos(angles[target_idx]), np.sin(angles[target_idx])
-                    
-                    # Create curved path
-                    mid_angle = (angles[source_idx] + angles[target_idx]) / 2
-                    mid_dist = 0.5 + link['value'] / 200
-                    xm, ym = mid_dist * np.cos(mid_angle), mid_dist * np.sin(mid_angle)
-                    
-                    # Quadratic bezier curve
-                    t = np.linspace(0, 1, 50)
-                    x = (1-t)**2 * x0 + 2*(1-t)*t * xm + t**2 * x1
-                    y = (1-t)**2 * y0 + 2*(1-t)*t * ym + t**2 * y1
+                n = len(nodes)
+                angles = np.linspace(0, 2*np.pi, n, endpoint=False)
                 
-                fig_chord.add_trace(go.Scatter(
-                    x=x, y=y,
-                    mode='lines',
-                    line=dict(width=link['value']/20 + 1, color='rgba(100,100,100,0.5)'),
-                    hoverinfo='skip',
-                    showlegend=False,
-                    name=link.get('label', '')
-                ))
-            
-            fig_chord.update_layout(
-                title="Phase Relationship Network",
-                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.5, 1.5]),
-                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.5, 1.5]),
-                width=600,
-                height=500,
-                plot_bgcolor='white'
-            )
-            
-            st.plotly_chart(fig_chord, use_container_width=True)
-        else:
-            st.info("Add phase data to generate chord diagram")
+                fig_chord = go.Figure()
+                
+                # Add nodes as points
+                for i, node in enumerate(nodes):
+                    x, y = np.cos(angles[i]), np.sin(angles[i])
+                    fig_chord.add_trace(go.Scatter(
+                        x=[x], y=[y],
+                        mode='markers+text',
+                        marker=dict(size=25, color=node['color'], line=dict(width=3, color='white')),
+                        text=[node['name']],
+                        textposition='top center',
+                        name=node['name'],
+                        hoverinfo='name',
+                        showlegend=False,
+                        textfont=dict(size=12, weight='bold')
+                    ))
+                
+                # Add links as curved lines
+                for link in links:
+                    source_idx = link['source']
+                    target_idx = link['target']
+                    
+                    if source_idx == target_idx:
+                        x0, y0 = np.cos(angles[source_idx]), np.sin(angles[source_idx])
+                        theta = np.linspace(0, 2*np.pi, 50)
+                        r = 0.15 * min(link['value'] / 100, 1.0)
+                        x = x0 + r * np.cos(theta)
+                        y = y0 + r * np.sin(theta)
+                    else:
+                        x0, y0 = np.cos(angles[source_idx]), np.sin(angles[source_idx])
+                        x1, y1 = np.cos(angles[target_idx]), np.sin(angles[target_idx])
+                        
+                        mid_angle = (angles[source_idx] + angles[target_idx]) / 2
+                        mid_dist = 0.5 + min(link['value'] / 200, 0.3)
+                        xm, ym = mid_dist * np.cos(mid_angle), mid_dist * np.sin(mid_angle)
+                        
+                        t = np.linspace(0, 1, 50)
+                        x = (1-t)**2 * x0 + 2*(1-t)*t * xm + t**2 * x1
+                        y = (1-t)**2 * y0 + 2*(1-t)*t * ym + t**2 * y1
+                    
+                    link_color = nodes[source_idx]['color'] if source_idx == target_idx else 'rgba(100,100,100,0.4)'
+                    
+                    fig_chord.add_trace(go.Scatter(
+                        x=x, y=y,
+                        mode='lines',
+                        line=dict(width=min(link['value']/15 + 1, 8), color=link_color),
+                        hoverinfo='skip',
+                        showlegend=False,
+                        name=link.get('label', '')
+                    ))
+                
+                fig_chord.update_layout(
+                    title="Phase Relationship Network",
+                    xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.8, 1.8], visible=False),
+                    yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.8, 1.8], visible=False),
+                    width=650,
+                    height=550,
+                    plot_bgcolor='white',
+                    paper_bgcolor='white',
+                    margin=dict(l=20, r=20, t=50, b=20)
+                )
+                
+                st.plotly_chart(fig_chord, use_container_width=True)
+                
+                with st.expander("📖 How to Read the Chord Diagram"):
+                    st.write("""
+                    - **Nodes** (colored circles): Represent HCP ε, FCC γ phases and Boundaries
+                    - **Self-loops** (small circles): Show relative abundance of each component
+                    - **Connecting lines**: Represent interfaces/interactions between phases
+                    - **Line thickness**: Proportional to interface strength or morphological similarity
+                    - **Hover** over elements to see detailed values
+                    
+                    *This visualization helps identify phase distribution patterns and interfacial characteristics.*
+                    """)
+            else:
+                st.info("ℹ️ Add phase data to generate chord diagram visualization")
+                
+        except Exception as chord_error:
+            st.warning(f"⚠️ Chord diagram display issue: {chord_error}")
+            st.info("✅ Other analysis results remain available")
     
     # --- Data Export Section ---
     
     st.markdown("---")
     st.subheader("📥 Export Results")
     
-    # Create comprehensive CSV
     filename_base = Path(uploaded_file.name if uploaded_file else selected_filename).stem
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
@@ -1068,17 +1146,17 @@ if uploaded_file is not None and selected_folder_image is not None:
             },
             "morphology_summary": {
                 phase: {
-                    "grain_count": len(df_all[df_all['Phase'] == phase]),
-                    "mean_area": df_all[df_all['Phase'] == phase]['Area (µm²)'].mean(),
-                    "mean_ecd": df_all[df_all['Phase'] == phase]['ECD (µm)'].mean(),
-                    "mean_circularity": df_all[df_all['Phase'] == phase]['Circularity'].mean()
+                    "grain_count": int(len(df_all[df_all['Phase'] == phase])),
+                    "mean_area": float(df_all[df_all['Phase'] == phase]['Area (µm²)'].mean()),
+                    "mean_ecd": float(df_all[df_all['Phase'] == phase]['ECD (µm)'].mean()),
+                    "mean_circularity": float(df_all[df_all['Phase'] == phase]['Circularity'].mean())
                 }
                 for phase in df_all['Phase'].unique()
             },
             "grains": df_all.to_dict('records')
         }
         
-        json_str = json.dumps(json_data, indent=2)
+        json_str = json.dumps(json_data, indent=2, default=str)
         st.download_button(
             label="🔧 Download Analysis Data (JSON)",
             data=json_str.encode('utf-8'),
@@ -1107,7 +1185,6 @@ if uploaded_file is not None and selected_folder_image is not None:
         """)
 
 else:
-    # Welcome/instructions state
     st.info("👈 Select an image from the sidebar to begin analysis")
     
     with st.expander("📖 How to Use"):
@@ -1131,9 +1208,9 @@ else:
         5. Download data in CSV or JSON format
         
         ### 📊 Advanced Visualizations
-        - **Radar Chart**: Compare morphological metrics between phases
-        - **Chord Diagram**: Visualize phase relationships and interfaces
-        - **Histograms**: Grain size and shape distributions
+        - **Radar Chart**: Compare morphological metrics between phases (normalized 0-1 scale)
+        - **Chord Diagram**: Visualize phase relationships and interface strength
+        - **Histograms**: Grain size and shape distributions with Plotly
         
         ### ⚠️ BMP File Issues on Streamlit Cloud
         If BMP files fail to load:
@@ -1176,6 +1253,7 @@ plotly>=5.17.0
         - Lower saturation threshold to detect faded colors
         - Adjust value threshold for brightness variations
         - Use morphology to clean noisy masks
+        - Test with known-good PNG files first to isolate BMP issues
         """)
 
 # Footer
